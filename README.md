@@ -1,114 +1,233 @@
-# workbuddy-cliproxy
+# WorkBuddy CLIProxyAPI Provider
 
-这是 [lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy) 的持续维护 Fork。当前维护目标是跟进 CodeBuddy 模型变化、CLIProxyAPI 插件 ABI 与认证生命周期，并以真实请求验证反代可用性。
+[![Release](https://img.shields.io/github/v/release/libukai/workbuddy-cliproxy)](https://github.com/libukai/workbuddy-cliproxy/releases)
+[![CI](https://github.com/libukai/workbuddy-cliproxy/actions/workflows/ci.yml/badge.svg)](https://github.com/libukai/workbuddy-cliproxy/actions/workflows/ci.yml)
+[![License](https://img.shields.io/github/license/libukai/workbuddy-cliproxy)](LICENSE)
 
-把**腾讯 CodeBuddy**（`copilot.tencent.com`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 CodeBuddy 背后的模型。
+把腾讯 CodeBuddy 的模型接入 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)，向本地客户端提供 OpenAI Chat Completions 和 Anthropic 兼容接口。
 
-对 [Sliverkiss/cpa-plugin](https://github.com/Sliverkiss/cpa-plugin) 公开 `workbuddy.so` 的 clean-room 逆向重写,补齐了源码与 x86_64 支持;workbuddy 的原始设计归属 Sliverkiss。
+这是一个社区维护的外置 Provider 插件，不属于腾讯或 CLIProxyAPI 官方组件。项目 Fork 自 [lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy)，其 clean-room 实现来源于 [Sliverkiss/cpa-plugin](https://github.com/Sliverkiss/cpa-plugin) 公开的 `workbuddy.so`。
 
-## 工作原理
+## 主要能力
 
-在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录凭据由 CPA 保存在认证目录的 `workbuddy*.json` 文件中。
+- CodeBuddy 扫码登录、凭据持久化和到期前刷新。
+- OpenAI / Anthropic 兼容调用，支持流式和非流式响应。
+- 通过 CLIProxyAPI Host HTTP Bridge 复用宿主代理、请求上下文和传输记录。
+- 多账号独立 Auth ID，以及同一 refresh token 的并发刷新去重。
+- 思考内容、工具调用和指定函数 `tool_choice` 兼容处理。
+- 嵌入式模型目录，以及可热重载的外部模型 manifest。
+- macOS 和 Linux CI 构建；持续测试 CLIProxyAPI SDK `7.2.30`、`7.2.130` 和 `7.2.145`。
 
-维护版保留既有 `workbuddy.json` 的兼容读取；新登录会使用基于账号标识哈希生成的 `workbuddy-<hash>.json`，避免文件名暴露 UID，并为后续多账号轮询保留独立 Auth ID。并发刷新同一个 refresh token 时只执行一次上游兑换。
+## 当前状态
 
-## 模型
+当前维护版：[`v0.2.0`](https://github.com/libukai/workbuddy-cliproxy/releases/tag/v0.2.0)
 
-`glm-5.3` · `glm-5.3-flash` · `glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k3` · `kimi-k2.7` · `kimi-k2.6` · `minimax-m3` · `minimax-m3-pay` · `hy4-preview` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash`
+已在 macOS arm64 上使用 CLIProxyAPI `7.2.130` 和 `7.2.145` 完成真实验证，包括：
 
-具体可用性以 CodeBuddy 账号权限为准。
+- 插件加载和模型注册；
+- 非流式与流式生成；
+- 上游 HTTP 错误保真；
+- 指定函数调用及 arguments 聚合；
+- 配置和模型 manifest 热重载；
+- 认证元数据与旧版 `workbuddy.json` 兼容。
 
-默认目录来自嵌入动态库的 [`models.yaml`](models.yaml)。如需不重新编译即可替换目录，可在插件配置中填写绝对路径 `model_manifest`;修改 manifest 后需要触发一次 CPA 配置重载。
+Linux 构建会在 CI 中完成，但发布前仍应在目标架构上做真实账号验证。
 
-## 安装
+## 支持的模型
 
-**前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
+| 系列 | 模型 ID |
+|---|---|
+| GLM | `glm-5.3`、`glm-5.3-flash`、`glm-5.2`、`glm-5.1`、`glm-5v-turbo` |
+| Kimi | `kimi-k3`、`kimi-k2.7`、`kimi-k2.6` |
+| MiniMax | `minimax-m3`、`minimax-m3-pay` |
+| 混元 | `hy4-preview`、`hy3`、`hy3-preview`、`hy3-preview-agent` |
+| DeepSeek | `deepseek-v4-pro`、`deepseek-v4-flash` |
+
+模型是否真实可用，以 CodeBuddy 账号权限和一次真实请求为准。`GET /v1/models` 只证明模型已注册，不等于账号拥有调用权限。
+
+默认目录来自 [`models.yaml`](models.yaml)。如需在不重新编译插件的情况下替换目录，可配置外部 `model_manifest`。
+
+## 快速开始
+
+### 1. 前置条件
+
+- 带动态插件支持的 CLIProxyAPI v7.2.x；
+- 可正常登录的 CodeBuddy 账号；
+- 与 CLIProxyAPI 进程一致的操作系统和 CPU 架构；
+- 从源码构建时需要 Go 1.26+ 和可用的 C 编译器。
+
+### 2. 获取插件
+
+macOS arm64 可以直接使用 [Release](https://github.com/libukai/workbuddy-cliproxy/releases) 中的 ZIP。下载后先根据 `checksums.txt` 验证 SHA-256，再将 `workbuddy.dylib` 放入 CLIProxyAPI 插件目录。
+
+macOS 通过 launchd 加载插件时，可能需要对已校验的本地副本执行 ad-hoc 签名：
+
+```bash
+codesign --force --sign - --timestamp=none workbuddy.dylib
+codesign --verify --strict --verbose=2 workbuddy.dylib
+```
+
+从源码构建：
 
 ```bash
 git clone https://github.com/libukai/workbuddy-cliproxy.git
 cd workbuddy-cliproxy
+
+# macOS
+CGO_ENABLED=1 GOOS=darwin GOARCH=arm64 \
+  go build -trimpath -buildmode=c-shared -o workbuddy.dylib .
+
+# Linux 示例
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
-  go build -buildmode=c-shared -o workbuddy.so .
+  go build -trimpath -buildmode=c-shared -o workbuddy.so .
 ```
 
-产物:`.so`(Linux)/ `.dylib`(macOS)/ `.dll`(Windows)。放到 CPA 的 `plugins/` 目录,在 `config.yaml` 启用:
+动态库扩展名分别为：macOS `.dylib`、Linux `.so`、Windows `.dll`。
+
+### 3. 启用插件
 
 ```yaml
 plugins:
   enabled: true
-  dir: "plugins"
+  dir: "/absolute/path/to/plugins"
   configs:
     workbuddy:
       enabled: true
       priority: 100
       prompt_rewrite: false
-      # model_manifest: "/absolute/path/to/models.yaml"
+      # model_manifest: "/absolute/path/to/workbuddy-models.yaml"
 ```
 
-重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功,`GET /v1/models` 也能看到上面的模型。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 CodeBuddy。
+重启或重新加载 CLIProxyAPI 配置。日志出现以下内容，说明插件已注册：
 
-## 使用
+```text
+plugin loaded ... plugin_id=workbuddy
+plugin registered ... plugin_name=workbuddy
+```
 
-CPA 默认端口 `8317`,API key 见 `config.yaml` 的 `api-keys`。
+### 4. 登录 CodeBuddy
 
-| 协议 | Base URL |
-|------|----------|
-| OpenAI | `http://<host>:8317/v1` |
-| Anthropic | `http://<host>:8317`(不带 `/v1`,走 `x-api-key`) |
+打开 CLIProxyAPI 管理面板，添加 `workbuddy` 凭据并完成 CodeBuddy 扫码登录。
+
+旧版 `workbuddy.json` 会继续按原 ID 加载。新登录账号使用 `workbuddy-<hash>.json`，文件名不会直接暴露 UID，并可为多个账号保留独立 Auth ID。
+
+认证文件包含 access token 和 refresh token，应保持 `0600` 权限，不得提交到 Git 仓库或发送到日志、聊天和公开 Issue。
+
+### 5. 验证
+
+先确认模型已注册：
 
 ```bash
-# Claude Code
-export ANTHROPIC_BASE_URL=http://localhost:8317
+curl http://127.0.0.1:8317/v1/models \
+  -H "Authorization: Bearer <api-key>"
+```
+
+再发送一次最小真实请求：
+
+```bash
+curl http://127.0.0.1:8317/v1/chat/completions \
+  -H "Authorization: Bearer <api-key>" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "glm-5.3-flash",
+    "messages": [{"role": "user", "content": "只回复 OK"}],
+    "stream": false
+  }'
+```
+
+只有真实请求返回成功，才能说明插件、凭据、账号权限和上游模型共同可用。
+
+## 客户端接入
+
+CLIProxyAPI 默认端口为 `8317`，客户端 API Key 取自 CLIProxyAPI 配置中的 `api-keys`。
+
+| 协议 | Base URL |
+|---|---|
+| OpenAI | `http://127.0.0.1:8317/v1` |
+| Anthropic | `http://127.0.0.1:8317` |
+
+Claude Code 示例：
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_API_KEY=<api-key>
 export ANTHROPIC_MODEL=hy3-preview-agent
 claude
 ```
 
-```bash
-# curl / OpenAI
-curl http://localhost:8317/v1/chat/completions \
-  -H "Authorization: Bearer <api-key>" -H "Content-Type: application/json" \
-  -d '{"model":"hy3-preview-agent","messages":[{"role":"user","content":"你好"}],"stream":true}'
+## 实现说明
+
+```text
+OpenAI / Anthropic 客户端
+            ↓
+       CLIProxyAPI
+  协议转换・路由・认证・代理
+            ↓
+     workbuddy 动态插件
+  登录・模型・请求方言・流聚合
+            ↓
+    copilot.tencent.com
 ```
 
-流式 / 非流式都支持;非流式请求会被内部转成流式再聚合(CodeBuddy 上游 `code 11101` 拒绝非流式)。
+### 流式与非流式
 
-## Claude Code 兼容性
+CodeBuddy 上游拒绝原生非流式请求，因此插件统一向上游请求 SSE：
 
-本 Fork 继承了上游针对两句旧版 Claude Code system 模板的精确字符串改写:
+- 流式客户端通过 `host.http.do_stream` 和 `host.stream.emit` 实时接收 chunk；
+- 非流式客户端由插件聚合 SSE 后返回单个 `chat.completion`；
+- 上游 400、401、429 和 5xx 会尽量保留原 HTTP 语义，而不是统一变成 500。
 
-- `You are Claude Code, Anthropic's official CLI for Claude.`(身份句)
-- `Main branch (you will usually use this for PRs)`(git 注入句)
+### 工具调用
 
-该行为在维护版中默认关闭。只有显式配置 `prompt_rewrite: true` 时，workbuddy 才会对匹配到的旧模板做最小改写(`CLI`→`CLI tool`、`Main branch`→`Default branch`)。该逻辑依赖具体客户端版本和上游审核规则，不能作为稳定兼容保证，也可能涉及 CodeBuddy 的使用条款边界。
+非流式响应会按 `tool_calls[].index` 合并拆分的调用 ID、函数名和 arguments。
 
-生产使用方应自行评估是否启用这条 Claude Code 兼容路径。
+CodeBuddy 的 `tool_choice` 只接受字符串。客户端使用 OpenAI 指定函数对象时，插件会仅保留被指定函数，并将选择方式转换为 `"required"`，以保留“必须调用该函数”的语义。
 
-## 思考模式
+### 思考模式
 
-hy3 系列(`hy3` / `hy3-preview` / `hy3-preview-agent`)自动开最大思考:workbuddy 转发前强制 `reasoning_effort=high`,覆盖客户端任何设置。CodeBuddy 只对 `high` 真正开深度思考(`medium` / `max` / `xhigh` 等档位它直接忽略),所以这已是 hy3 能用的最高档。思考内容走 SSE 的 `delta.reasoning_content`,客户端要支持渲染思考块才看得到。
+`hy3` 系列会将 `reasoning_effort` 规范为 CodeBuddy 实际识别的 `high`。思考内容通过 `delta.reasoning_content` 返回，客户端需要支持对应字段才能显示。
 
-## 工具调用
+### 配置热重载
 
-非流式请求会按 `tool_calls[].index` 合并上游 SSE 中拆分的 ID、函数名和 arguments。CodeBuddy 的 `tool_choice` 只接受字符串；当客户端使用 OpenAI 的指定函数对象时，维护版会只保留被指定的函数并转换成 `"required"`，避免改变“必须调用该函数”的语义。
+插件实现 `plugin.register` 和 `plugin.reconfigure`：
 
-## 流式
+- `prompt_rewrite`：是否启用旧版 Claude Code 模板改写，默认 `false`；
+- `model_manifest`：外部 YAML/JSON 模型目录的绝对路径。
 
-真流式(async):转发上游时边读边通过 `host.stream.emit` 把每个 chunk 实时推给 CPA,客户端逐字收到(不是等收齐了一股脑)。hy3 几千字的思考过程也是实时流出的,不是憋半天再刷出来。
+外部 manifest 只有在 CLIProxyAPI 发生配置重载时才会重新读取。无效、空目录或重复模型 ID 会被拒绝，并保留上一版有效配置。
 
-## 开发与验证
+## 风险与边界
+
+- 本项目使用 CodeBuddy 当前客户端接口，它不是腾讯对外承诺稳定性的通用公开 API；接口、模型 ID 和账号策略可能随时变化。
+- 模型出现在界面、源码或 `/v1/models` 中，都不能代替真实账号调用。
+- 建议 CLIProxyAPI 仅监听 `127.0.0.1`；对局域网或公网开放前必须增加独立鉴权和网络边界。
+- `prompt_rewrite` 默认关闭。该功能依赖具体 Claude Code 模板和 CodeBuddy 审核规则，也可能涉及上游使用条款；启用前应自行评估。
+- 不要把测试环境、静态审查、编译成功或登录成功单独表述为“反代已经可用”。
+
+## 开发与维护
 
 ```bash
-gofmt -w main.go main_test.go
+gofmt -w *.go
 go test ./...
+go test -race ./...
 go vet ./...
-CGO_ENABLED=1 go build -buildmode=c-shared -o workbuddy.dylib .
+CGO_ENABLED=1 go build -trimpath -buildmode=c-shared -o workbuddy.dylib .
 ```
 
-发布或更新模型时不能只检查 `/v1/models`;至少要用目标账号对每个新增模型发出一次最小真实请求。当前维护版会把凭据过期时间同步给 CLIProxyAPI 的刷新调度，并在插件卸载时取消正在运行的异步流。刷新与模型执行通过 `host.http.do` / `host.http.do_stream` 复用 CLIProxyAPI 的宿主传输、代理和请求记录；扫码登录仍使用独立 Cookie Jar 保持登录状态隔离。
+长期维护时应分别检查：
 
-架构优化以 CLIProxyAPI 官方 Kimi Provider 为主要参考，具体差异和迁移边界见 [`docs/OFFICIAL_PROVIDER_GAP.md`](docs/OFFICIAL_PROVIDER_GAP.md)，宿主版本验证见 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)。外置插件只依赖公开 Plugin ABI，不导入 CLIProxyAPI 的 `internal/*` 包。
+1. 上游插件仓库和本 Fork 的提交差异；
+2. CLIProxyAPI Release、Plugin ABI 和官方 Provider 范式；
+3. CodeBuddy 模型目录和账号权限；
+4. 插件加载、认证刷新、流式、工具调用及错误语义；
+5. 每个新增或重命名模型的最小真实请求。
+
+相关资料：
+
+- [官方 Provider 差异表](docs/OFFICIAL_PROVIDER_GAP.md)
+- [宿主兼容矩阵](docs/COMPATIBILITY.md)
+- [维护路线图](docs/ROADMAP.md)
 
 ## License
 
-MIT。
+[MIT](LICENSE)
