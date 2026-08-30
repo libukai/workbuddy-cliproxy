@@ -7,6 +7,9 @@ import (
 	"errors"
 	"io"
 	"net/http"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -55,6 +58,111 @@ func TestAuthDataSchedulesRefreshBeforeExpiry(t *testing.T) {
 	}
 	if got := data.Metadata["expires_at"]; got != expiresAt.Format(time.RFC3339) {
 		t.Fatalf("expires_at = %v, want %s", got, expiresAt.Format(time.RFC3339))
+	}
+}
+
+func TestLoginIdentityIsStableAndOpaque(t *testing.T) {
+	auth := &storedAuth{
+		Auth:    storedTokens{AccessToken: "access", RefreshToken: "refresh"},
+		Account: storedAccount{UID: "user-123", EnterpriseID: "enterprise-456"},
+	}
+	first := identityForLogin(auth)
+	second := identityForLogin(auth)
+	if first != second {
+		t.Fatalf("login identity is not stable: %+v != %+v", first, second)
+	}
+	if !strings.HasPrefix(first.ID, "workbuddy-") || first.FileName != first.ID+".json" {
+		t.Fatalf("unexpected login identity: %+v", first)
+	}
+	if strings.Contains(first.ID, auth.Account.UID) || strings.Contains(first.FileName, auth.Account.EnterpriseID) {
+		t.Fatalf("login identity exposes account identifiers: %+v", first)
+	}
+
+	other := *auth
+	other.Account.UID = "user-789"
+	if identityForLogin(&other).ID == first.ID {
+		t.Fatal("different accounts received the same auth ID")
+	}
+}
+
+func TestParseAuthPreservesCredentialFileIdentity(t *testing.T) {
+	storage, err := json.Marshal(&storedAuth{Auth: storedTokens{AccessToken: "access"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := json.Marshal(pluginapi.AuthParseRequest{FileName: "workbuddy-account123.json", RawJSON: storage})
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, err := handleParseAuth(request)
+	if err != nil {
+		t.Fatalf("handleParseAuth: %v", err)
+	}
+	var env envelope
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatal(err)
+	}
+	var response pluginapi.AuthParseResponse
+	if err := json.Unmarshal(env.Result, &response); err != nil {
+		t.Fatal(err)
+	}
+	if response.Auth.ID != "workbuddy-account123" || response.Auth.FileName != "workbuddy-account123.json" {
+		t.Fatalf("parsed auth identity = %q / %q", response.Auth.ID, response.Auth.FileName)
+	}
+}
+
+func TestConcurrentRefreshIsDeduplicated(t *testing.T) {
+	originalHostCall := hostCall
+	t.Cleanup(func() { hostCall = originalHostCall })
+	var calls atomic.Int32
+	hostCall = func(method string, _ []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("host callback method = %q, want %q", method, pluginabi.MethodHostHTTPDo)
+		}
+		calls.Add(1)
+		time.Sleep(25 * time.Millisecond)
+		body, err := json.Marshal(apiEnvelope{Code: 0, Data: json.RawMessage(`{"accessToken":"new-access","refreshToken":"new-refresh","expiresIn":3600}`)})
+		if err != nil {
+			return nil, err
+		}
+		return okEnvelope(pluginapi.HTTPResponse{StatusCode: http.StatusOK, Body: body})
+	}
+
+	storage, err := json.Marshal(&storedAuth{Auth: storedTokens{AccessToken: "old-access", RefreshToken: "dedupe-refresh-token"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	request, err := json.Marshal(rpcAuthRefreshRequest{
+		AuthRefreshRequest: pluginapi.AuthRefreshRequest{AuthID: "workbuddy-account123", StorageJSON: storage},
+		HostCallbackID:     "callback-refresh",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	const workers = 8
+	start := make(chan struct{})
+	errs := make(chan error, workers)
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			_, errRefresh := handleRefreshAuth(request)
+			errs <- errRefresh
+		}()
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for errRefresh := range errs {
+		if errRefresh != nil {
+			t.Fatalf("concurrent refresh: %v", errRefresh)
+		}
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("host refresh calls = %d, want 1", got)
 	}
 }
 

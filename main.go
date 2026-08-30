@@ -61,12 +61,14 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/http/cookiejar"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -74,6 +76,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
+	"golang.org/x/sync/singleflight"
 )
 
 const (
@@ -115,6 +118,7 @@ var (
 	lifecycleStop  context.CancelFunc
 	streamWG       sync.WaitGroup
 	hostStreams    = make(map[string]struct{})
+	refreshGroup   singleflight.Group
 )
 
 func main() {}
@@ -768,11 +772,80 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 	}
 	return okEnvelope(pluginapi.AuthParseResponse{
 		Handled: true,
-		Auth:    toAuthData(sa),
+		Auth:    toAuthData(sa, identityFromFileName(req.FileName)),
 	})
 }
 
-func toAuthData(sa *storedAuth) pluginapi.AuthData {
+type authIdentity struct {
+	ID       string
+	FileName string
+	Label    string
+}
+
+func identityFromFileName(fileName string) authIdentity {
+	fileName = strings.TrimSpace(fileName)
+	if fileName == "" {
+		return authIdentity{ID: providerName, FileName: authFileName, Label: "WorkBuddy"}
+	}
+	fileName = filepath.Base(fileName)
+	id := strings.TrimSuffix(fileName, ".json")
+	if id == "" {
+		id = providerName
+	}
+	return authIdentity{ID: id, FileName: fileName, Label: "WorkBuddy"}
+}
+
+func identityForLogin(sa *storedAuth) authIdentity {
+	seed := ""
+	if sa != nil {
+		seed = strings.TrimSpace(sa.Account.UID) + "\x00" + strings.TrimSpace(sa.Account.EnterpriseID)
+		if strings.Trim(seed, "\x00") == "" {
+			seed = strings.TrimSpace(sa.Auth.RefreshToken)
+		}
+		if seed == "" {
+			seed = strings.TrimSpace(sa.Auth.AccessToken)
+		}
+	}
+	if seed == "" {
+		return identityFromFileName(authFileName)
+	}
+	digest := fmt.Sprintf("%x", sha256.Sum256([]byte(seed)))
+	id := providerName + "-" + digest[:12]
+	return authIdentity{ID: id, FileName: id + ".json", Label: "WorkBuddy (" + digest[:8] + ")"}
+}
+
+func identityFromAuthID(authID string) authIdentity {
+	authID = strings.TrimSuffix(filepath.Base(strings.TrimSpace(authID)), ".json")
+	if authID == "" {
+		return identityFromFileName(authFileName)
+	}
+	label := "WorkBuddy"
+	if strings.HasPrefix(authID, providerName+"-") {
+		suffix := strings.TrimPrefix(authID, providerName+"-")
+		if len(suffix) > 8 {
+			suffix = suffix[:8]
+		}
+		if suffix != "" {
+			label += " (" + suffix + ")"
+		}
+	}
+	return authIdentity{ID: authID, FileName: authID + ".json", Label: label}
+}
+
+func toAuthData(sa *storedAuth, identities ...authIdentity) pluginapi.AuthData {
+	identity := identityFromFileName(authFileName)
+	if len(identities) > 0 {
+		candidate := identities[0]
+		if candidate.ID != "" {
+			identity.ID = candidate.ID
+		}
+		if candidate.FileName != "" {
+			identity.FileName = candidate.FileName
+		}
+		if candidate.Label != "" {
+			identity.Label = candidate.Label
+		}
+	}
 	storage, _ := json.Marshal(sa)
 	metadata := map[string]any{"type": providerName}
 	nextRefresh := time.Time{}
@@ -786,9 +859,9 @@ func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	}
 	return pluginapi.AuthData{
 		Provider:         providerName,
-		ID:               providerName,
-		FileName:         authFileName,
-		Label:            "WorkBuddy",
+		ID:               identity.ID,
+		FileName:         identity.FileName,
+		Label:            identity.Label,
 		StorageJSON:      storage,
 		Metadata:         metadata,
 		NextRefreshAfter: nextRefresh,
@@ -880,7 +953,7 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 	loginStates.Delete(state)
 	return okEnvelope(pluginapi.AuthLoginPollResponse{
 		Status: pluginapi.AuthLoginStatusSuccess,
-		Auth:   toAuthData(sa),
+		Auth:   toAuthData(sa, identityForLogin(sa)),
 	})
 }
 
@@ -893,11 +966,34 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
+	if strings.TrimSpace(sa.Auth.RefreshToken) == "" {
+		return nil, fmt.Errorf("refresh: missing refresh token")
+	}
+	refreshKey := fmt.Sprintf("%x", sha256.Sum256([]byte(sa.Auth.RefreshToken)))
+	result, err, _ := refreshGroup.Do(refreshKey, func() (any, error) {
+		return refreshStoredAuth(sa, req.HostCallbackID)
+	})
+	if err != nil {
+		return nil, err
+	}
+	refreshed, ok := result.(*storedAuth)
+	if !ok || refreshed == nil {
+		return nil, fmt.Errorf("refresh: invalid refreshed credential")
+	}
+	authData := toAuthData(refreshed, identityFromAuthID(req.AuthID))
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData, NextRefreshAfter: authData.NextRefreshAfter})
+}
+
+func refreshStoredAuth(sa *storedAuth, callbackID string) (*storedAuth, error) {
+	if sa == nil {
+		return nil, fmt.Errorf("refresh: credential is nil")
+	}
+	refreshed := *sa
 	headers := func(r *http.Request) {
 		commonHeaders(r)
-		r.Header.Set("X-Refresh-Token", sa.Auth.RefreshToken)
-		if sa.Account.EnterpriseID != "" {
-			r.Header.Set("X-Enterprise-Id", sa.Account.EnterpriseID)
+		r.Header.Set("X-Refresh-Token", refreshed.Auth.RefreshToken)
+		if refreshed.Account.EnterpriseID != "" {
+			r.Header.Set("X-Enterprise-Id", refreshed.Account.EnterpriseID)
 		}
 		r.Header.Set("X-Auth-Refresh-Source", providerName)
 	}
@@ -906,7 +1002,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	headers(httpReq)
-	hostResp, err := doHostHTTP(req.HostCallbackID, http.MethodPost, endpointTokenRefresh, httpReq.Header, nil)
+	hostResp, err := doHostHTTP(callbackID, http.MethodPost, endpointTokenRefresh, httpReq.Header, nil)
 	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
@@ -924,16 +1020,15 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 	if err := json.Unmarshal(env.Data, &tok); err != nil || tok.AccessToken == "" {
 		return nil, fmt.Errorf("refresh_failed: no accessToken")
 	}
-	sa.Auth.AccessToken = tok.AccessToken
+	refreshed.Auth.AccessToken = tok.AccessToken
 	if tok.RefreshToken != "" {
-		sa.Auth.RefreshToken = tok.RefreshToken
+		refreshed.Auth.RefreshToken = tok.RefreshToken
 	}
 	if tok.Domain != "" {
-		sa.Auth.Domain = tok.Domain
+		refreshed.Auth.Domain = tok.Domain
 	}
-	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	authData := toAuthData(sa)
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData, NextRefreshAfter: authData.NextRefreshAfter})
+	refreshed.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
+	return &refreshed, nil
 }
 
 // -----------------------------------------------------------------------------

@@ -1,2 +1,4 @@
 github.com/router-for-me/CLIProxyAPI/v7 v7.2.30 h1:Dx3lnwBly/OMZn6Z5//JN7RPOWH3+UJhakdeR/LcyIY=
 github.com/router-for-me/CLIProxyAPI/v7 v7.2.30/go.mod h1:f4pcyAej8RoeRhIxJfm+OUMkCKaApiA8WzxR2XVlBh8=
+golang.org/x/sync v0.18.0 h1:kr88TuHDroi+UVf+0hZnirlk8o8T+4MrK6mr60WkH/I=
+golang.org/x/sync v0.18.0/go.mod h1:9KTHXmSnoGruLpwFjVSX0lNNA75CykiMECbovNTZqGI=

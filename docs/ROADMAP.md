@@ -18,7 +18,7 @@
 
 ## v0.4.x: multi-account operations
 
-- Use stable per-account auth IDs and credential file names.
+- Verify stable opaque per-account auth IDs with two live accounts and round-robin routing.
 - Avoid shared cookies across accounts.
 - Add per-account health, quota, and cooldown signals without logging tokens.
 - Test round-robin routing, token rotation, concurrent streaming, and forced shutdown.

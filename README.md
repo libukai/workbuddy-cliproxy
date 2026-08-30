@@ -8,7 +8,9 @@
 
 ## 工作原理
 
-在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录后凭据存为 `workbuddy.json`。
+在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录凭据由 CPA 保存在认证目录的 `workbuddy*.json` 文件中。
+
+维护版保留既有 `workbuddy.json` 的兼容读取；新登录会使用基于账号标识哈希生成的 `workbuddy-<hash>.json`，避免文件名暴露 UID，并为后续多账号轮询保留独立 Auth ID。并发刷新同一个 refresh token 时只执行一次上游兑换。
 
 ## 模型
 

@@ -6,8 +6,8 @@ The built-in Kimi provider is the closest architectural reference because it com
 
 | Area | Official provider pattern | WorkBuddy fork status | Next action |
 |---|---|---|---|
-| Auth expiry | RFC3339 expiry metadata plus five-minute refresh lead | Aligned in v0.2.0 | Add refresh concurrency deduplication |
-| Auth identity | Unique file and auth ID per account | Fixed `workbuddy.json` and `workbuddy` ID | Introduce backward-compatible multi-account IDs |
+| Auth expiry | RFC3339 expiry metadata, five-minute refresh lead, and concurrent refresh deduplication | Aligned in v0.2.0 | Add a non-rotating refresh-token integration fixture |
+| Auth identity | Unique file and auth ID per account | New logins use an opaque account hash; legacy `workbuddy.json` remains unchanged | Verify two live accounts and host round-robin routing |
 | Request context | `http.NewRequestWithContext` using the host request context | Refresh and execution use callback-scoped host HTTP; plugin lifecycle still guards asynchronous pumps | Keep login cookie flow isolated and add callback cancellation tests |
 | Proxy policy | `NewProxyAwareHTTPClient` with global and per-auth proxy settings | Refresh and execution use `host.http.do` / `host.http.do_stream`; login still uses an isolated local client | Track public ABI support for auth-specific host HTTP callbacks |
 | HTTP errors | Typed status error preserves upstream status | Aligned for synchronous and stream bootstrap errors | Parse CodeBuddy business codes into stable error categories |
