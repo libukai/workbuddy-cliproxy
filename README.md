@@ -1,25 +1,31 @@
 # workbuddy-cliproxy
 
+这是 [lovingfish/workbuddy-cliproxy](https://github.com/lovingfish/workbuddy-cliproxy) 的持续维护 Fork。当前维护目标是跟进 CodeBuddy 模型变化、CLIProxyAPI 插件 ABI 与认证生命周期，并以真实请求验证反代可用性。
+
 把**腾讯 CodeBuddy**（`copilot.tencent.com`）封装成 [CLIProxyAPI](https://github.com/router-for-me/CLIProxyAPI)(CPA)插件,任何支持 OpenAI / Anthropic 协议的客户端(Claude Code、Cursor、Cline、SDK……)都能直接调用 CodeBuddy 背后的模型。
 
 对 [Sliverkiss/cpa-plugin](https://github.com/Sliverkiss/cpa-plugin) 公开 `workbuddy.so` 的 clean-room 逆向重写,补齐了源码与 x86_64 支持;workbuddy 的原始设计归属 Sliverkiss。
 
 ## 工作原理
 
-在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录后凭据存为 `workbuddy.json`。
+在 CPA 里注册为 `workbuddy` provider:负责 CodeBuddy 扫码登录、token 刷新,并把请求转发到 `copilot.tencent.com/v2/chat/completions`。登录凭据由 CPA 保存在认证目录的 `workbuddy*.json` 文件中。
+
+维护版保留既有 `workbuddy.json` 的兼容读取；新登录会使用基于账号标识哈希生成的 `workbuddy-<hash>.json`，避免文件名暴露 UID，并为后续多账号轮询保留独立 Auth ID。并发刷新同一个 refresh token 时只执行一次上游兑换。
 
 ## 模型
 
-`glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k2.7` · `minimax-m3-pay` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash`
+`glm-5.3` · `glm-5.3-flash` · `glm-5.2` · `glm-5.1` · `glm-5v-turbo` · `kimi-k3` · `kimi-k2.7` · `kimi-k2.6` · `minimax-m3` · `minimax-m3-pay` · `hy4-preview` · `hy3` · `hy3-preview` · `hy3-preview-agent` · `deepseek-v4-pro` · `deepseek-v4-flash`
 
 具体可用性以 CodeBuddy 账号权限为准。
+
+默认目录来自嵌入动态库的 [`models.yaml`](models.yaml)。如需不重新编译即可替换目录，可在插件配置中填写绝对路径 `model_manifest`;修改 manifest 后需要触发一次 CPA 配置重载。
 
 ## 安装
 
 **前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
 
 ```bash
-git clone https://github.com/lovingfish/workbuddy-cliproxy.git
+git clone https://github.com/libukai/workbuddy-cliproxy.git
 cd workbuddy-cliproxy
 CGO_ENABLED=1 GOOS=linux GOARCH=amd64 \
   go build -buildmode=c-shared -o workbuddy.so .
@@ -32,7 +38,11 @@ plugins:
   enabled: true
   dir: "plugins"
   configs:
-    workbuddy: { enabled: true, priority: 100 }
+    workbuddy:
+      enabled: true
+      priority: 100
+      prompt_rewrite: false
+      # model_manifest: "/absolute/path/to/models.yaml"
 ```
 
 重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功,`GET /v1/models` 也能看到上面的模型。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 CodeBuddy。
@@ -65,22 +75,39 @@ curl http://localhost:8317/v1/chat/completions \
 
 ## Claude Code 兼容性
 
-腾讯 CodeBuddy 的内容审核把 Claude Code 的两句固定 system 模板逐字加进了黑名单,命中即回"敏感内容"拒答:
+本 Fork 继承了上游针对两句旧版 Claude Code system 模板的精确字符串改写:
 
 - `You are Claude Code, Anthropic's official CLI for Claude.`(身份句)
 - `Main branch (you will usually use this for PRs)`(git 注入句)
 
-任何一字改动都绕过(精确匹配,非语义审核)。workbuddy 转发前会自动把这两句做最小改写(`CLI`→`CLI tool`、`Main branch`→`Default branch`),语义不变,Claude Code 照常工作。
+该行为在维护版中默认关闭。只有显式配置 `prompt_rewrite: true` 时，workbuddy 才会对匹配到的旧模板做最小改写(`CLI`→`CLI tool`、`Main branch`→`Default branch`)。该逻辑依赖具体客户端版本和上游审核规则，不能作为稳定兼容保证，也可能涉及 CodeBuddy 的使用条款边界。
 
-属于 cat-and-mouse:腾讯哪天多加模板句,得跟着改 `sanitizeBlockedTemplates`。
+生产使用方应自行评估是否启用这条 Claude Code 兼容路径。
 
 ## 思考模式
 
 hy3 系列(`hy3` / `hy3-preview` / `hy3-preview-agent`)自动开最大思考:workbuddy 转发前强制 `reasoning_effort=high`,覆盖客户端任何设置。CodeBuddy 只对 `high` 真正开深度思考(`medium` / `max` / `xhigh` 等档位它直接忽略),所以这已是 hy3 能用的最高档。思考内容走 SSE 的 `delta.reasoning_content`,客户端要支持渲染思考块才看得到。
 
+## 工具调用
+
+非流式请求会按 `tool_calls[].index` 合并上游 SSE 中拆分的 ID、函数名和 arguments。CodeBuddy 的 `tool_choice` 只接受字符串；当客户端使用 OpenAI 的指定函数对象时，维护版会只保留被指定的函数并转换成 `"required"`，避免改变“必须调用该函数”的语义。
+
 ## 流式
 
 真流式(async):转发上游时边读边通过 `host.stream.emit` 把每个 chunk 实时推给 CPA,客户端逐字收到(不是等收齐了一股脑)。hy3 几千字的思考过程也是实时流出的,不是憋半天再刷出来。
+
+## 开发与验证
+
+```bash
+gofmt -w main.go main_test.go
+go test ./...
+go vet ./...
+CGO_ENABLED=1 go build -buildmode=c-shared -o workbuddy.dylib .
+```
+
+发布或更新模型时不能只检查 `/v1/models`;至少要用目标账号对每个新增模型发出一次最小真实请求。当前维护版会把凭据过期时间同步给 CLIProxyAPI 的刷新调度，并在插件卸载时取消正在运行的异步流。刷新与模型执行通过 `host.http.do` / `host.http.do_stream` 复用 CLIProxyAPI 的宿主传输、代理和请求记录；扫码登录仍使用独立 Cookie Jar 保持登录状态隔离。
+
+架构优化以 CLIProxyAPI 官方 Kimi Provider 为主要参考，具体差异和迁移边界见 [`docs/OFFICIAL_PROVIDER_GAP.md`](docs/OFFICIAL_PROVIDER_GAP.md)，宿主版本验证见 [`docs/COMPATIBILITY.md`](docs/COMPATIBILITY.md)。外置插件只依赖公开 Plugin ABI，不导入 CLIProxyAPI 的 `internal/*` 包。
 
 ## License
 

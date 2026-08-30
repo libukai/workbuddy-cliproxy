@@ -1,0 +1,32 @@
+# Maintenance roadmap
+
+## v0.2.x: production baseline
+
+- Keep verified CodeBuddy model IDs current.
+- Surface credential expiry to CLIProxyAPI and refresh before expiration.
+- Cancel active streams during plugin shutdown and report upstream read failures.
+- Add CI for tests, vetting, and native shared-library builds.
+- Preserve reproducible build metadata and checksums for every release.
+
+## v0.3.x: maintainability
+
+- Extend the versioned model manifest with per-model reasoning policy and evidence links.
+- Split auth, transport, model, transformation, and streaming code into focused files.
+- Verify multi-turn tool results and parallel tool calls against live CodeBuddy models.
+- Preserve structured upstream error categories such as auth, quota, model, review, and retryable server errors.
+- Add automated manifest evidence and stale-verification checks.
+
+## v0.4.x: multi-account operations
+
+- Verify stable opaque per-account auth IDs with two live accounts and round-robin routing.
+- Avoid shared cookies across accounts.
+- Add per-account health, quota, and cooldown signals without logging tokens.
+- Test round-robin routing, token rotation, concurrent streaming, and forced shutdown.
+
+## Continuous compatibility checks
+
+- Compare `origin/main` with `upstream/main`.
+- Check the latest CLIProxyAPI release and plugin ABI compatibility.
+- Compare the CodeBuddy UI model list with the plugin manifest.
+- Run `/v1/models` plus one minimal real request for each newly added or renamed model.
+- Treat authentication, model registration, and real inference as separate validation states.
