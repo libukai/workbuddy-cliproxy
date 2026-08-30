@@ -60,9 +60,11 @@ import "C"
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
@@ -76,6 +78,7 @@ import (
 
 const (
 	providerName  = "workbuddy"
+	pluginVersion = "0.2.0"
 	authFileName  = "workbuddy.json"
 	upstreamBase  = "https://copilot.tencent.com"
 	clientUA      = "CLI/2.63.2 CodeBuddy/2.63.2"
@@ -87,7 +90,8 @@ const (
 	endpointTokenRefresh = upstreamBase + "/v2/plugin/auth/token/refresh"
 	endpointChat         = upstreamBase + "/v2/chat/completions"
 
-	loginTTL = 5 * time.Minute
+	loginTTL        = 10 * time.Minute
+	authRefreshLead = 5 * time.Minute
 )
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
@@ -103,6 +107,10 @@ var (
 	loginStates    sync.Map             // state(string) -> *loginCtx
 	httpClientOnce sync.Once
 	sharedClient   *http.Client
+	lifecycleMu    sync.Mutex
+	lifecycleCtx   context.Context
+	lifecycleStop  context.CancelFunc
+	streamWG       sync.WaitGroup
 )
 
 func main() {}
@@ -113,9 +121,15 @@ func main() {}
 
 //export cliproxy_plugin_init
 func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_api) C.int {
-	if plugin == nil {
+	if host == nil || plugin == nil {
 		return 1
 	}
+	lifecycleMu.Lock()
+	if lifecycleStop != nil {
+		lifecycleStop()
+	}
+	lifecycleCtx, lifecycleStop = context.WithCancel(context.Background())
+	lifecycleMu.Unlock()
 	hostAPI = host
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
@@ -155,7 +169,26 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 }
 
 //export cliproxyPluginShutdown
-func cliproxyPluginShutdown() {}
+func cliproxyPluginShutdown() {
+	lifecycleMu.Lock()
+	stop := lifecycleStop
+	lifecycleStop = nil
+	lifecycleMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	streamWG.Wait()
+}
+
+func beginStream() (context.Context, bool) {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	if lifecycleCtx == nil || lifecycleStop == nil {
+		return nil, false
+	}
+	streamWG.Add(1)
+	return lifecycleCtx, true
+}
 
 // -----------------------------------------------------------------------------
 // Host calls (async streaming)
@@ -295,9 +328,9 @@ func wbRegistration() registration {
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
 			Name:             providerName,
-			Version:          "0.1.0",
-			Author:           "lovingfish (clean-room rebuild; original workbuddy by Sliverkiss)",
-			GitHubRepository: "https://github.com/lovingfish/workbuddy-cliproxy",
+			Version:          pluginVersion,
+			Author:           "libukai (maintained fork; upstream by lovingfish; original workbuddy by Sliverkiss)",
+			GitHubRepository: "https://github.com/libukai/workbuddy-cliproxy",
 		},
 		Capabilities: registrationCapability{
 			ModelProvider:         true,
@@ -320,11 +353,17 @@ func wbModels() []pluginapi.ModelInfo {
 		{"glm-5.2", "GLM-5.2", 1000000},
 		{"glm-5.1", "GLM-5.1", 131072},
 		{"glm-5v-turbo", "GLM-5V Turbo", 131072},
-		{"kimi-k2.7", "Kimi K2.7", 262144},
+		{"glm-5.3", "GLM-5.3", 1000000},
+		{"glm-5.3-flash", "GLM-5.3 Flash", 1000000},
+		{"kimi-k2.7", "Kimi K2.7 Code", 262144},
+		{"kimi-k3", "Kimi K3", 262144},
+		{"kimi-k2.6", "Kimi K2.6", 262144},
 		{"minimax-m3-pay", "MiniMax M3", 204800},
+		{"minimax-m3", "MiniMax M3", 204800},
 		{"hy3", "Hy3", 262144},
 		{"hy3-preview", "Hy3 Preview", 262144},
 		{"hy3-preview-agent", "Hy3 Preview Agent", 262144},
+		{"hy4-preview", "Hy4 Preview", 262144},
 		{"deepseek-v4-pro", "DeepSeek V4 Pro", 1000000},
 		{"deepseek-v4-flash", "DeepSeek V4 Flash", 1000000},
 	}
@@ -416,11 +455,15 @@ func sharedHTTPClient() *http.Client {
 	httpClientOnce.Do(func() {
 		jar, _ := cookiejar.New(nil)
 		sharedClient = &http.Client{
-			Timeout: 120 * time.Second,
 			Transport: &http.Transport{
-				MaxIdleConns:        20,
-				IdleConnTimeout:     90 * time.Second,
-				MaxIdleConnsPerHost: 5,
+				Proxy:                 http.ProxyFromEnvironment,
+				DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+				TLSHandshakeTimeout:   15 * time.Second,
+				ResponseHeaderTimeout: 60 * time.Second,
+				ExpectContinueTimeout: time.Second,
+				MaxIdleConns:          50,
+				IdleConnTimeout:       90 * time.Second,
+				MaxIdleConnsPerHost:   20,
 			},
 			Jar: jar,
 		}
@@ -531,13 +574,24 @@ func handleParseAuth(raw []byte) ([]byte, error) {
 
 func toAuthData(sa *storedAuth) pluginapi.AuthData {
 	storage, _ := json.Marshal(sa)
+	metadata := map[string]any{"type": providerName}
+	nextRefresh := time.Time{}
+	if sa != nil && sa.Auth.ExpiresAt > 0 {
+		expiresAt := time.Unix(sa.Auth.ExpiresAt, 0).UTC()
+		metadata["expires_at"] = expiresAt.Format(time.RFC3339)
+		nextRefresh = expiresAt.Add(-authRefreshLead)
+		if nextRefresh.Before(time.Now()) {
+			nextRefresh = time.Now()
+		}
+	}
 	return pluginapi.AuthData{
-		Provider:    providerName,
-		ID:          providerName,
-		FileName:    authFileName,
-		Label:       "WorkBuddy",
-		StorageJSON: storage,
-		Metadata:    map[string]any{"type": providerName},
+		Provider:         providerName,
+		ID:               providerName,
+		FileName:         authFileName,
+		Label:            "WorkBuddy",
+		StorageJSON:      storage,
+		Metadata:         metadata,
+		NextRefreshAfter: nextRefresh,
 	}
 }
 
@@ -666,7 +720,8 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		sa.Auth.Domain = tok.Domain
 	}
 	sa.Auth.ExpiresAt = time.Now().Add(time.Duration(tok.ExpiresIn) * time.Second).Unix()
-	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: toAuthData(sa)})
+	authData := toAuthData(sa)
+	return okEnvelope(pluginapi.AuthRefreshResponse{Auth: authData, NextRefreshAfter: authData.NextRefreshAfter})
 }
 
 // -----------------------------------------------------------------------------
@@ -749,8 +804,18 @@ func handleExecStream(raw []byte) ([]byte, error) {
 		streamClose(req.StreamID)
 		return okEnvelope(streamResponse{Headers: headers})
 	}
+	streamCtx, ok := beginStream()
+	if !ok {
+		streamEmitError(req.StreamID, "plugin is shutting down")
+		streamClose(req.StreamID)
+		return okEnvelope(streamResponse{Headers: headers})
+	}
+	httpReq = httpReq.WithContext(streamCtx)
 	backendHeaders(httpReq, sa)
-	go pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	go func() {
+		defer streamWG.Done()
+		pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+	}()
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
@@ -769,8 +834,10 @@ func streamHeaders() http.Header {
 func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
-		streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-		streamClose(streamID)
+		if httpReq.Context().Err() == nil {
+			streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
+			streamClose(streamID)
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -798,7 +865,12 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 			break
 		}
 	}
-	streamClose(streamID)
+	if errScan := scanner.Err(); errScan != nil && httpReq.Context().Err() == nil {
+		streamEmitError(streamID, fmt.Sprintf("upstream stream read failed: %v", errScan))
+	}
+	if httpReq.Context().Err() == nil {
+		streamClose(streamID)
+	}
 }
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
@@ -818,7 +890,7 @@ func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]plugi
 		errPayload, _ := io.ReadAll(resp.Body)
 		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
 	}
-	return aggregateSSE(resp.Body, sseFramed), nil
+	return aggregateSSE(resp.Body, sseFramed)
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -843,7 +915,7 @@ func clientNeedsSSEFrame(metadata map[string]any) bool {
 // payload is emitted as a "data: " line for cross-format translators; otherwise
 // the payload is the raw JSON object and the host chat-completions writer adds
 // the framing itself.
-func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
+func aggregateSSE(r io.Reader, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	var chunks []pluginapi.ExecutorStreamChunk
@@ -861,7 +933,10 @@ func aggregateSSE(r io.Reader, sseFramed bool) []pluginapi.ExecutorStreamChunk {
 		}
 		chunks = append(chunks, pluginapi.ExecutorStreamChunk{Payload: []byte(cleaned)})
 	}
-	return chunks
+	if errScan := scanner.Err(); errScan != nil {
+		return nil, fmt.Errorf("upstream stream read failed: %w", errScan)
+	}
+	return chunks, nil
 }
 
 // cleanChunkJSON strips empty-valued fields (null/""/[]/{}) from choice deltas
@@ -1075,6 +1150,9 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 				finish = v
 			}
 		}
+	}
+	if errScan := scanner.Err(); errScan != nil {
+		return nil, fmt.Errorf("upstream completion read failed: %w", errScan)
 	}
 
 	message := map[string]any{"role": firstNonEmpty(role, "assistant"), "content": content}
