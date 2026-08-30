@@ -8,13 +8,13 @@ The built-in Kimi provider is the closest architectural reference because it com
 |---|---|---|---|
 | Auth expiry | RFC3339 expiry metadata plus five-minute refresh lead | Aligned in v0.2.0 | Add refresh concurrency deduplication |
 | Auth identity | Unique file and auth ID per account | Fixed `workbuddy.json` and `workbuddy` ID | Introduce backward-compatible multi-account IDs |
-| Request context | `http.NewRequestWithContext` using the host request context | Plugin lifecycle context for async streams | Move upstream I/O to host HTTP callbacks |
-| Proxy policy | `NewProxyAwareHTTPClient` with global and per-auth proxy settings | Environment proxy only | Use `host.http.do` and `host.http.do_stream` |
+| Request context | `http.NewRequestWithContext` using the host request context | Refresh and execution use callback-scoped host HTTP; plugin lifecycle still guards asynchronous pumps | Keep login cookie flow isolated and add callback cancellation tests |
+| Proxy policy | `NewProxyAwareHTTPClient` with global and per-auth proxy settings | Refresh and execution use `host.http.do` / `host.http.do_stream`; login still uses an isolated local client | Track public ABI support for auth-specific host HTTP callbacks |
 | HTTP errors | Typed status error preserves upstream status | Aligned for synchronous and stream bootstrap errors | Parse CodeBuddy business codes into stable error categories |
-| Stream bootstrap | Open upstream and validate status before returning stream | Aligned | Move stream transport to host HTTP callbacks |
-| Stream cancellation | Request context and channel select | Plugin lifecycle cancel plus host stream emit failure | Bind host HTTP stream lifetime to callback ID |
+| Stream bootstrap | Open upstream and validate status before returning stream | Aligned through `host.http.do_stream` / `stream_read` / `stream_close` | Add partial-chunk SSE framing regression coverage |
+| Stream cancellation | Request context, channel select, and `plugin.quiesce` before unload | Host HTTP stream lifetime is bound to callback ID; shutdown and quiesce close active host streams | CLIProxyAPI 7.2.130 lacks quiesce and can hit its API-server shutdown deadline; verify graceful drain against the latest stable host |
 | Response headers | Forward upstream headers | Aligned | Add regression tests against a fake upstream |
-| Usage and logging | Host request log, usage reporter, request IDs | No structured usage observer | Use host callbacks and optional usage capability |
+| Usage and logging | Host request log, usage reporter, request IDs | Host HTTP callbacks capture request/response transport; no structured usage observer | Add optional usage capability without duplicating host accounting |
 | Translation | Central CLIProxyAPI translators and thinking pipeline | Host translates to/from chat completions; plugin applies provider quirks | Keep provider rewrites narrow and testable |
 | Tool calls | Normalizes tool links and preserves streamed fragments | Non-stream aggregation appends fragments | Merge tool calls by index and concatenate arguments |
 | Models | Catalog and provider-specific capability metadata | Hard-coded verified list | Move to a versioned manifest with last-verified evidence |

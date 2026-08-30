@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,9 @@ import (
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginabi"
+	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 )
 
 func TestVerifiedModelCatalog(t *testing.T) {
@@ -104,6 +108,28 @@ func TestShutdownCancelsActiveStreams(t *testing.T) {
 	}
 }
 
+func TestQuiesceRejectsNewStreams(t *testing.T) {
+	lifecycleMu.Lock()
+	lifecycleCtx, lifecycleStop = context.WithCancel(context.Background())
+	hostStreams = make(map[string]struct{})
+	lifecycleMu.Unlock()
+
+	if _, err := handleMethod(methodPluginQuiesce, nil); err != nil {
+		t.Fatalf("plugin quiesce: %v", err)
+	}
+	if _, ok := beginStream(); ok {
+		t.Fatal("beginStream accepted a new stream after quiesce")
+	}
+	if _, err := handleMethod(pluginabi.MethodPluginRegister, nil); err != nil {
+		t.Fatalf("plugin register after quiesce: %v", err)
+	}
+	if _, ok := beginStream(); !ok {
+		t.Fatal("plugin register did not reactivate the lifecycle after quiesce")
+	}
+	streamWG.Done()
+	quiescePlugin()
+}
+
 func TestUpstreamErrorPreservesHTTPStatusAndRetryability(t *testing.T) {
 	tests := []struct {
 		status    int
@@ -140,6 +166,70 @@ func TestApplyStreamHeadersPreservesUpstreamMetadata(t *testing.T) {
 	}
 	if got := headers.Get("Content-Type"); got != "text/event-stream" {
 		t.Fatalf("Content-Type = %q, want text/event-stream", got)
+	}
+}
+
+func TestHostHTTPDoUsesCallbackContextAndDecodesResponse(t *testing.T) {
+	originalHostCall := hostCall
+	t.Cleanup(func() { hostCall = originalHostCall })
+	hostCall = func(method string, raw []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPDo {
+			t.Fatalf("host callback method = %q, want %q", method, pluginabi.MethodHostHTTPDo)
+		}
+		var request rpcHostHTTPRequest
+		if err := json.Unmarshal(raw, &request); err != nil {
+			t.Fatalf("decode host request: %v", err)
+		}
+		if request.HostCallbackID != "callback-1" || request.Method != http.MethodPost || request.URL != "https://example.test/chat" {
+			t.Fatalf("unexpected host request: %+v", request)
+		}
+		if !bytes.Equal(request.Body, []byte(`{"model":"test"}`)) {
+			t.Fatalf("host request body = %q", request.Body)
+		}
+		return okEnvelope(pluginapi.HTTPResponse{
+			StatusCode: http.StatusOK,
+			Headers:    http.Header{"X-Request-Id": {"upstream-1"}},
+			Body:       []byte(`{"ok":true}`),
+		})
+	}
+
+	response, err := doHostHTTP("callback-1", http.MethodPost, "https://example.test/chat", http.Header{"Content-Type": {"application/json"}}, []byte(`{"model":"test"}`))
+	if err != nil {
+		t.Fatalf("doHostHTTP: %v", err)
+	}
+	if response.StatusCode != http.StatusOK || response.Headers.Get("X-Request-Id") != "upstream-1" || !bytes.Equal(response.Body, []byte(`{"ok":true}`)) {
+		t.Fatalf("unexpected host response: %+v", response)
+	}
+}
+
+func TestHostHTTPStreamReaderReadsUntilDone(t *testing.T) {
+	originalHostCall := hostCall
+	t.Cleanup(func() { hostCall = originalHostCall })
+	reads := 0
+	hostCall = func(method string, raw []byte) ([]byte, error) {
+		if method != pluginabi.MethodHostHTTPStreamRead {
+			t.Fatalf("host callback method = %q, want stream read", method)
+		}
+		var request rpcHostHTTPStreamReadRequest
+		if err := json.Unmarshal(raw, &request); err != nil {
+			t.Fatalf("decode stream read request: %v", err)
+		}
+		if request.StreamID != "stream-1" {
+			t.Fatalf("stream ID = %q, want stream-1", request.StreamID)
+		}
+		reads++
+		if reads == 1 {
+			return okEnvelope(rpcHostHTTPStreamReadResponse{Payload: []byte("hello ")})
+		}
+		return okEnvelope(rpcHostHTTPStreamReadResponse{Payload: []byte("world"), Done: true})
+	}
+
+	payload, err := io.ReadAll(&hostHTTPStreamReader{streamID: "stream-1"})
+	if err != nil {
+		t.Fatalf("read host stream: %v", err)
+	}
+	if string(payload) != "hello world" || reads != 2 {
+		t.Fatalf("payload = %q, reads = %d", payload, reads)
 	}
 }
 

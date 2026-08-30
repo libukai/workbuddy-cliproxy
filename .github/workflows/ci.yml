@@ -34,3 +34,25 @@ jobs:
         env:
           CGO_ENABLED: "1"
         run: go build -buildmode=c-shared -o workbuddy.dylib .
+
+  sdk-compatibility:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        cli_proxy_sdk: [v7.2.30, v7.2.130, v7.2.145]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Select CLIProxyAPI SDK
+        run: |
+          go mod edit -require=github.com/router-for-me/CLIProxyAPI/v7@${{ matrix.cli_proxy_sdk }}
+          go mod tidy
+      - name: Test SDK compatibility
+        run: go test ./...
+      - name: Build Linux plugin
+        env:
+          CGO_ENABLED: "1"
+        run: go build -buildmode=c-shared -o workbuddy.so .

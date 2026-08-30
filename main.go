@@ -92,6 +92,9 @@ const (
 
 	loginTTL        = 10 * time.Minute
 	authRefreshLead = 5 * time.Minute
+	// plugin.quiesce was added after the minimum SDK used by the maintained fork.
+	// Keep the wire method local so newer hosts can drain streams before unload.
+	methodPluginQuiesce = "plugin.quiesce"
 )
 
 // loginCtx holds the cookie-affined HTTP client for one in-flight login flow.
@@ -111,6 +114,7 @@ var (
 	lifecycleCtx   context.Context
 	lifecycleStop  context.CancelFunc
 	streamWG       sync.WaitGroup
+	hostStreams    = make(map[string]struct{})
 )
 
 func main() {}
@@ -124,18 +128,22 @@ func cliproxy_plugin_init(host *C.cliproxy_host_api, plugin *C.cliproxy_plugin_a
 	if host == nil || plugin == nil {
 		return 1
 	}
-	lifecycleMu.Lock()
-	if lifecycleStop != nil {
-		lifecycleStop()
-	}
-	lifecycleCtx, lifecycleStop = context.WithCancel(context.Background())
-	lifecycleMu.Unlock()
+	activateLifecycle()
 	hostAPI = host
 	plugin.abi_version = C.uint32_t(pluginabi.ABIVersion)
 	plugin.call = C.cliproxy_plugin_call_fn(C.cliproxyPluginCall)
 	plugin.free_buffer = C.cliproxy_plugin_free_fn(C.cliproxyPluginFree)
 	plugin.shutdown = C.cliproxy_plugin_shutdown_fn(C.cliproxyPluginShutdown)
 	return 0
+}
+
+func activateLifecycle() {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	if lifecycleStop != nil {
+		return
+	}
+	lifecycleCtx, lifecycleStop = context.WithCancel(context.Background())
 }
 
 //export cliproxyPluginCall
@@ -170,12 +178,24 @@ func cliproxyPluginFree(ptr unsafe.Pointer, len C.size_t) {
 
 //export cliproxyPluginShutdown
 func cliproxyPluginShutdown() {
+	quiescePlugin()
+}
+
+func quiescePlugin() {
 	lifecycleMu.Lock()
 	stop := lifecycleStop
 	lifecycleStop = nil
+	streamIDs := make([]string, 0, len(hostStreams))
+	for streamID := range hostStreams {
+		streamIDs = append(streamIDs, streamID)
+	}
+	hostStreams = make(map[string]struct{})
 	lifecycleMu.Unlock()
 	if stop != nil {
 		stop()
+	}
+	for _, streamID := range streamIDs {
+		_ = closeHostHTTPStream(streamID)
 	}
 	streamWG.Wait()
 }
@@ -190,14 +210,32 @@ func beginStream() (context.Context, bool) {
 	return lifecycleCtx, true
 }
 
+func registerHostStream(streamID string) bool {
+	lifecycleMu.Lock()
+	defer lifecycleMu.Unlock()
+	if lifecycleStop == nil || streamID == "" {
+		return false
+	}
+	hostStreams[streamID] = struct{}{}
+	return true
+}
+
+func unregisterHostStream(streamID string) {
+	lifecycleMu.Lock()
+	delete(hostStreams, streamID)
+	lifecycleMu.Unlock()
+}
+
 // -----------------------------------------------------------------------------
 // Host calls (async streaming)
 // -----------------------------------------------------------------------------
 
-// hostCall invokes a host RPC method via the function-pointer table captured
+var hostCall = nativeHostCall
+
+// nativeHostCall invokes a host RPC method via the function-pointer table captured
 // at init. Used to push stream chunks back asynchronously (host.stream.emit /
 // host.stream.close).
-func hostCall(method string, request []byte) ([]byte, error) {
+func nativeHostCall(method string, request []byte) ([]byte, error) {
 	if hostAPI == nil || hostAPI.call == nil {
 		return nil, fmt.Errorf("host API unavailable")
 	}
@@ -223,6 +261,114 @@ func hostCall(method string, request []byte) ([]byte, error) {
 		return out, fmt.Errorf("host call %s returned %d", method, int(rc))
 	}
 	return out, nil
+}
+
+func callHostJSON(method string, request, response any) error {
+	payload, errMarshal := json.Marshal(request)
+	if errMarshal != nil {
+		return fmt.Errorf("encode host callback %s request: %w", method, errMarshal)
+	}
+	raw, errCall := hostCall(method, payload)
+	if errCall != nil {
+		return errCall
+	}
+	var env envelope
+	if errUnmarshal := json.Unmarshal(raw, &env); errUnmarshal != nil {
+		return fmt.Errorf("decode host callback %s envelope: %w", method, errUnmarshal)
+	}
+	if !env.OK {
+		if env.Error == nil {
+			return fmt.Errorf("host callback %s failed", method)
+		}
+		if env.Error.HTTPStatus > 0 {
+			return &providerError{
+				code:       firstNonEmpty(env.Error.Code, "host_callback_error"),
+				message:    env.Error.Message,
+				retryable:  env.Error.Retryable,
+				httpStatus: env.Error.HTTPStatus,
+			}
+		}
+		return fmt.Errorf("host callback %s failed: %s", method, env.Error.Message)
+	}
+	if response == nil || len(env.Result) == 0 {
+		return nil
+	}
+	if errUnmarshal := json.Unmarshal(env.Result, response); errUnmarshal != nil {
+		return fmt.Errorf("decode host callback %s result: %w", method, errUnmarshal)
+	}
+	return nil
+}
+
+func doHostHTTP(callbackID, method, url string, headers http.Header, body []byte) (pluginapi.HTTPResponse, error) {
+	var response pluginapi.HTTPResponse
+	err := callHostJSON(pluginabi.MethodHostHTTPDo, rpcHostHTTPRequest{
+		HostCallbackID: callbackID,
+		Method:         method,
+		URL:            url,
+		Headers:        headers.Clone(),
+		Body:           append([]byte(nil), body...),
+	}, &response)
+	return response, err
+}
+
+func openHostHTTPStream(callbackID, method, url string, headers http.Header, body []byte) (rpcHostHTTPStreamResponse, error) {
+	var response rpcHostHTTPStreamResponse
+	err := callHostJSON(pluginabi.MethodHostHTTPDoStream, rpcHostHTTPRequest{
+		HostCallbackID: callbackID,
+		Method:         method,
+		URL:            url,
+		Headers:        headers.Clone(),
+		Body:           append([]byte(nil), body...),
+	}, &response)
+	if err != nil {
+		return rpcHostHTTPStreamResponse{}, err
+	}
+	if response.StreamID == "" {
+		return rpcHostHTTPStreamResponse{}, fmt.Errorf("host HTTP stream returned no stream ID")
+	}
+	return response, nil
+}
+
+func readHostHTTPStream(streamID string) (rpcHostHTTPStreamReadResponse, error) {
+	var response rpcHostHTTPStreamReadResponse
+	err := callHostJSON(pluginabi.MethodHostHTTPStreamRead, rpcHostHTTPStreamReadRequest{StreamID: streamID}, &response)
+	if err != nil {
+		return rpcHostHTTPStreamReadResponse{}, err
+	}
+	if response.Error != "" {
+		return rpcHostHTTPStreamReadResponse{}, fmt.Errorf("host HTTP stream failed: %s", response.Error)
+	}
+	return response, nil
+}
+
+func closeHostHTTPStream(streamID string) error {
+	if streamID == "" {
+		return nil
+	}
+	return callHostJSON(pluginabi.MethodHostHTTPStreamClose, rpcHostHTTPStreamCloseRequest{StreamID: streamID}, nil)
+}
+
+type hostHTTPStreamReader struct {
+	streamID string
+	buffer   []byte
+	done     bool
+}
+
+func (r *hostHTTPStreamReader) Read(p []byte) (int, error) {
+	for len(r.buffer) == 0 && !r.done {
+		chunk, errRead := readHostHTTPStream(r.streamID)
+		if errRead != nil {
+			return 0, errRead
+		}
+		r.buffer = append(r.buffer[:0], chunk.Payload...)
+		r.done = chunk.Done
+	}
+	if len(r.buffer) == 0 && r.done {
+		return 0, io.EOF
+	}
+	n := copy(p, r.buffer)
+	r.buffer = r.buffer[n:]
+	return n, nil
 }
 
 // streamEmit pushes one chunk payload to the host stream. Returns an error if
@@ -260,7 +406,11 @@ func streamClose(streamID string) {
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		activateLifecycle()
 		return okEnvelope(wbRegistration())
+	case methodPluginQuiesce:
+		quiescePlugin()
+		return okEnvelope(struct{}{})
 	case pluginabi.MethodModelStatic, pluginabi.MethodModelForAuth:
 		return okEnvelope(pluginapi.ModelResponse{Provider: providerName, Models: wbModels()})
 	case pluginabi.MethodAuthIdentifier:
@@ -332,6 +482,45 @@ type registrationCapability struct {
 type streamResponse struct {
 	Headers http.Header                     `json:"headers,omitempty"`
 	Chunks  []pluginapi.ExecutorStreamChunk `json:"chunks,omitempty"`
+}
+
+type rpcAuthRefreshRequest struct {
+	pluginapi.AuthRefreshRequest
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcExecutorRequest struct {
+	pluginapi.ExecutorRequest
+	StreamID       string `json:"stream_id,omitempty"`
+	HostCallbackID string `json:"host_callback_id,omitempty"`
+}
+
+type rpcHostHTTPRequest struct {
+	HostCallbackID string      `json:"host_callback_id,omitempty"`
+	Method         string      `json:"method,omitempty"`
+	URL            string      `json:"url,omitempty"`
+	Headers        http.Header `json:"headers,omitempty"`
+	Body           []byte      `json:"body,omitempty"`
+}
+
+type rpcHostHTTPStreamResponse struct {
+	StatusCode int         `json:"status_code"`
+	Headers    http.Header `json:"headers,omitempty"`
+	StreamID   string      `json:"stream_id,omitempty"`
+}
+
+type rpcHostHTTPStreamReadRequest struct {
+	StreamID string `json:"stream_id"`
+}
+
+type rpcHostHTTPStreamReadResponse struct {
+	Payload []byte `json:"payload,omitempty"`
+	Error   string `json:"error,omitempty"`
+	Done    bool   `json:"done,omitempty"`
+}
+
+type rpcHostHTTPStreamCloseRequest struct {
+	StreamID string `json:"stream_id"`
 }
 
 func wbRegistration() registration {
@@ -696,7 +885,7 @@ func handlePollLogin(raw []byte) ([]byte, error) {
 }
 
 func handleRefreshAuth(raw []byte) ([]byte, error) {
-	var req pluginapi.AuthRefreshRequest
+	var req rpcAuthRefreshRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -712,15 +901,27 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 		}
 		r.Header.Set("X-Auth-Refresh-Source", providerName)
 	}
-	data, status, err := doJSON(sharedHTTPClient(), http.MethodPost, endpointTokenRefresh, headers, nil)
+	httpReq, err := http.NewRequest(http.MethodPost, endpointTokenRefresh, nil)
 	if err != nil {
-		if status >= 400 {
-			return nil, fmt.Errorf("refresh rejected (HTTP %d)", status)
-		}
+		return nil, err
+	}
+	headers(httpReq)
+	hostResp, err := doHostHTTP(req.HostCallbackID, http.MethodPost, endpointTokenRefresh, httpReq.Header, nil)
+	if err != nil {
 		return nil, fmt.Errorf("refresh: %w", err)
 	}
+	if hostResp.StatusCode < 200 || hostResp.StatusCode >= 300 {
+		return nil, newUpstreamError(hostResp.StatusCode, hostResp.Body)
+	}
+	var env apiEnvelope
+	if err := json.Unmarshal(hostResp.Body, &env); err != nil {
+		return nil, fmt.Errorf("refresh response parse failed: %w", err)
+	}
+	if env.Code != 0 {
+		return nil, fmt.Errorf("refresh failed: code=%d msg=%s", env.Code, env.Msg)
+	}
 	var tok tokenData
-	if err := json.Unmarshal(data, &tok); err != nil || tok.AccessToken == "" {
+	if err := json.Unmarshal(env.Data, &tok); err != nil || tok.AccessToken == "" {
 		return nil, fmt.Errorf("refresh_failed: no accessToken")
 	}
 	sa.Auth.AccessToken = tok.AccessToken
@@ -740,7 +941,7 @@ func handleRefreshAuth(raw []byte) ([]byte, error) {
 // -----------------------------------------------------------------------------
 
 func handleExecExecute(raw []byte) ([]byte, error) {
-	var req pluginapi.ExecutorRequest
+	var req rpcExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -756,32 +957,22 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 		return nil, err
 	}
 	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	resp, err := doHostHTTP(req.HostCallbackID, http.MethodPost, endpointChat, httpReq.Header, body)
 	if err != nil {
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		payload, _ := io.ReadAll(resp.Body)
-		return nil, newUpstreamError(resp.StatusCode, payload)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, newUpstreamError(resp.StatusCode, resp.Body)
 	}
-	completion, err := aggregateCompletion(resp.Body, req.Model)
+	completion, err := aggregateCompletion(bytes.NewReader(resp.Body), req.Model)
 	if err != nil {
 		return nil, err
 	}
-	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion, Headers: resp.Header.Clone()})
-}
-
-// executorStreamRequest wraps the host's executor.execute_stream RPC: the
-// ExecutorRequest plus the async stream id the host uses to receive chunks.
-type executorStreamRequest struct {
-	pluginapi.ExecutorRequest
-	StreamID       string `json:"stream_id,omitempty"`
-	HostCallbackID string `json:"host_callback_id,omitempty"`
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion, Headers: resp.Headers.Clone()})
 }
 
 func handleExecStream(raw []byte) ([]byte, error) {
-	var req executorStreamRequest
+	var req rpcExecutorRequest
 	if err := json.Unmarshal(raw, &req); err != nil {
 		return nil, err
 	}
@@ -799,7 +990,7 @@ func handleExecStream(raw []byte) ([]byte, error) {
 
 	// No async stream id → fall back to synchronous chunk collection.
 	if req.StreamID == "" {
-		chunks, headers, errCollect := collectUpstreamStream(body, sa, sseFramed)
+		chunks, headers, errCollect := collectUpstreamStream(body, sa, sseFramed, req.HostCallbackID)
 		if errCollect != nil {
 			return nil, errCollect
 		}
@@ -818,22 +1009,30 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	}
 	httpReq = httpReq.WithContext(streamCtx)
 	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	resp, err := openHostHTTPStream(req.HostCallbackID, http.MethodPost, endpointChat, httpReq.Header, body)
 	if err != nil {
 		streamWG.Done()
 		return nil, fmt.Errorf("http_error: %w", err)
 	}
+	if !registerHostStream(resp.StreamID) {
+		_ = closeHostHTTPStream(resp.StreamID)
+		streamWG.Done()
+		return nil, fmt.Errorf("plugin is shutting down")
+	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		payload, _ := io.ReadAll(resp.Body)
-		_ = resp.Body.Close()
+		payload, _ := io.ReadAll(&hostHTTPStreamReader{streamID: resp.StreamID})
+		_ = closeHostHTTPStream(resp.StreamID)
+		unregisterHostStream(resp.StreamID)
 		streamWG.Done()
 		return nil, newUpstreamError(resp.StatusCode, payload)
 	}
-	headers := resp.Header.Clone()
+	headers := resp.Headers.Clone()
 	applyStreamHeaders(headers)
 	go func() {
 		defer streamWG.Done()
-		pumpUpstreamStream(resp, httpReq.Context(), req.StreamID, sseFramed)
+		defer unregisterHostStream(resp.StreamID)
+		defer closeHostHTTPStream(resp.StreamID)
+		pumpUpstreamStream(&hostHTTPStreamReader{streamID: resp.StreamID}, httpReq.Context(), req.StreamID, sseFramed)
 	}()
 	return okEnvelope(streamResponse{Headers: headers})
 }
@@ -848,9 +1047,8 @@ func applyStreamHeaders(h http.Header) {
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(resp *http.Response, ctx context.Context, streamID string, sseFramed bool) {
-	defer resp.Body.Close()
-	scanner := bufio.NewScanner(resp.Body)
+func pumpUpstreamStream(upstream io.Reader, ctx context.Context, streamID string, sseFramed bool) {
+	scanner := bufio.NewScanner(upstream)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
 		content := stripDataPrefix(scanner.Text())
@@ -878,26 +1076,24 @@ func pumpUpstreamStream(resp *http.Response, ctx context.Context, streamID strin
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
 // the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, http.Header, error) {
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool, callbackID string) ([]pluginapi.ExecutorStreamChunk, http.Header, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
 		return nil, nil, err
 	}
 	backendHeaders(httpReq, sa)
-	resp, err := sharedHTTPClient().Do(httpReq)
+	resp, err := doHostHTTP(callbackID, http.MethodPost, endpointChat, httpReq.Header, body)
 	if err != nil {
 		return nil, nil, fmt.Errorf("http_error: %w", err)
 	}
-	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, nil, newUpstreamError(resp.StatusCode, errPayload)
+		return nil, nil, newUpstreamError(resp.StatusCode, resp.Body)
 	}
-	chunks, errAggregate := aggregateSSE(resp.Body, sseFramed)
+	chunks, errAggregate := aggregateSSE(bytes.NewReader(resp.Body), sseFramed)
 	if errAggregate != nil {
 		return nil, nil, errAggregate
 	}
-	headers := resp.Header.Clone()
+	headers := resp.Headers.Clone()
 	applyStreamHeaders(headers)
 	return chunks, headers, nil
 }
