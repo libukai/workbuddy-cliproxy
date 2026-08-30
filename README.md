@@ -18,6 +18,8 @@
 
 具体可用性以 CodeBuddy 账号权限为准。
 
+默认目录来自嵌入动态库的 [`models.yaml`](models.yaml)。如需不重新编译即可替换目录，可在插件配置中填写绝对路径 `model_manifest`;修改 manifest 后需要触发一次 CPA 配置重载。
+
 ## 安装
 
 **前置**:运行中的 CLIProxyAPI v7.2.x(带 CGO / 插件支持)、CodeBuddy 账号、Go 1.26+ 与 gcc;编译架构需与 CPA 实例一致(amd64 / arm64)。
@@ -36,7 +38,11 @@ plugins:
   enabled: true
   dir: "plugins"
   configs:
-    workbuddy: { enabled: true, priority: 100 }
+    workbuddy:
+      enabled: true
+      priority: 100
+      prompt_rewrite: false
+      # model_manifest: "/absolute/path/to/models.yaml"
 ```
 
 重启 CPA,日志出现 `plugin loaded ... plugin_id=workbuddy` 即成功,`GET /v1/models` 也能看到上面的模型。然后到 CPA 面板添加 workbuddy 凭据,扫码登录 CodeBuddy。
@@ -74,9 +80,9 @@ curl http://localhost:8317/v1/chat/completions \
 - `You are Claude Code, Anthropic's official CLI for Claude.`(身份句)
 - `Main branch (you will usually use this for PRs)`(git 注入句)
 
-workbuddy 转发前会对匹配到的旧模板做最小改写(`CLI`→`CLI tool`、`Main branch`→`Default branch`)。该逻辑依赖具体客户端版本和上游审核规则，不能作为稳定兼容保证，也可能涉及 CodeBuddy 的使用条款边界。
+该行为在维护版中默认关闭。只有显式配置 `prompt_rewrite: true` 时，workbuddy 才会对匹配到的旧模板做最小改写(`CLI`→`CLI tool`、`Main branch`→`Default branch`)。该逻辑依赖具体客户端版本和上游审核规则，不能作为稳定兼容保证，也可能涉及 CodeBuddy 的使用条款边界。
 
-后续版本将把该行为改为显式配置项并默认关闭；在此之前，生产使用方应自行评估是否启用 Claude Code 兼容路径。
+生产使用方应自行评估是否启用这条 Claude Code 兼容路径。
 
 ## 思考模式
 

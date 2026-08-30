@@ -10,11 +10,11 @@
 
 ## v0.3.x: maintainability
 
-- Move model metadata and reasoning policy into a versioned manifest.
+- Extend the versioned model manifest with per-model reasoning policy and evidence links.
 - Split auth, transport, model, transformation, and streaming code into focused files.
 - Verify multi-turn tool results and parallel tool calls against live CodeBuddy models.
 - Preserve structured upstream error categories such as auth, quota, model, review, and retryable server errors.
-- Make prompt rewriting an explicit configuration option that is disabled by default.
+- Add automated manifest evidence and stale-verification checks.
 
 ## v0.4.x: multi-account operations
 

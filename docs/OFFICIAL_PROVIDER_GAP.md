@@ -15,11 +15,11 @@ The built-in Kimi provider is the closest architectural reference because it com
 | Stream cancellation | Request context, channel select, and `plugin.quiesce` before unload | Host HTTP stream lifetime is bound to callback ID; shutdown and quiesce close active host streams | CLIProxyAPI 7.2.130 lacks quiesce and can hit its API-server shutdown deadline; verify graceful drain against the latest stable host |
 | Response headers | Forward upstream headers | Aligned | Add regression tests against a fake upstream |
 | Usage and logging | Host request log, usage reporter, request IDs | Host HTTP callbacks capture request/response transport; no structured usage observer | Add optional usage capability without duplicating host accounting |
-| Translation | Central CLIProxyAPI translators and thinking pipeline | Host translates to/from chat completions; plugin applies provider quirks | Keep provider rewrites narrow and testable |
+| Translation | Central CLIProxyAPI translators and thinking pipeline | Host translates to/from chat completions; named tool choice is normalized narrowly; legacy prompt rewriting is explicit and default-off | Keep every provider rewrite narrow and backed by live evidence |
 | Tool calls | Normalizes tool links and preserves streamed fragments | Aligned for indexed fragment aggregation and named OpenAI tool choice | Add multi-turn tool-result and parallel-tool integration coverage |
-| Models | Catalog and provider-specific capability metadata | Hard-coded verified list | Move to a versioned manifest with last-verified evidence |
-| Configuration | Typed config fields and reconfigure handling | No plugin-specific config | Add model manifest path and default-off prompt rewriting |
-| Tests | Unit, race, transport, refresh, and stream tests | Baseline model, refresh, stream-error, and lifecycle tests | Add fake upstream integration and concurrent refresh tests |
+| Models | Catalog and provider-specific capability metadata | Embedded versioned `models.yaml` plus absolute-path manifest replacement | Automate evidence timestamps and capability drift checks |
+| Configuration | Typed config fields and reconfigure handling | `prompt_rewrite` and `model_manifest` ConfigFields support hot reconfigure | Add per-model reasoning policy without expanding unsafe rewrites |
+| Tests | Unit, race, transport, refresh, and stream tests | Unit, race, three-SDK compile matrix, two-host runtime checks, tool-call and hot-reconfigure coverage | Add fake upstream transport and second-account integration fixtures |
 
 ## Alignment rule
 
