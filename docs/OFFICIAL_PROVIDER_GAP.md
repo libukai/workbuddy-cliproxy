@@ -16,7 +16,7 @@ The built-in Kimi provider is the closest architectural reference because it com
 | Response headers | Forward upstream headers | Aligned | Add regression tests against a fake upstream |
 | Usage and logging | Host request log, usage reporter, request IDs | Host HTTP callbacks capture request/response transport; no structured usage observer | Add optional usage capability without duplicating host accounting |
 | Translation | Central CLIProxyAPI translators and thinking pipeline | Host translates to/from chat completions; plugin applies provider quirks | Keep provider rewrites narrow and testable |
-| Tool calls | Normalizes tool links and preserves streamed fragments | Non-stream aggregation appends fragments | Merge tool calls by index and concatenate arguments |
+| Tool calls | Normalizes tool links and preserves streamed fragments | Aligned for indexed fragment aggregation and named OpenAI tool choice | Add multi-turn tool-result and parallel-tool integration coverage |
 | Models | Catalog and provider-specific capability metadata | Hard-coded verified list | Move to a versioned manifest with last-verified evidence |
 | Configuration | Typed config fields and reconfigure handling | No plugin-specific config | Add model manifest path and default-off prompt rewriting |
 | Tests | Unit, race, transport, refresh, and stream tests | Baseline model, refresh, stream-error, and lifecycle tests | Add fake upstream integration and concurrent refresh tests |

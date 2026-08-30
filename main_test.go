@@ -192,6 +192,76 @@ func TestAggregateCompletionReturnsReaderError(t *testing.T) {
 	}
 }
 
+func TestAggregateCompletionMergesInterleavedToolCallFragments(t *testing.T) {
+	sse := strings.Join([]string{
+		`data: {"id":"chat-1","model":"test-model","choices":[{"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call-a","type":"function","function":{"name":"alpha","arguments":"{\"a\":"}},{"index":1,"id":"call-b","type":"function","function":{"name":"beta","arguments":"{\"b\":"}}]}}]}`,
+		`data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}},{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":"tool_calls"}]}`,
+		`data: [DONE]`,
+		"",
+	}, "\n")
+
+	raw, err := aggregateCompletion(strings.NewReader(sse), "test-model")
+	if err != nil {
+		t.Fatalf("aggregateCompletion: %v", err)
+	}
+	var completion map[string]any
+	if err := json.Unmarshal(raw, &completion); err != nil {
+		t.Fatalf("decode completion: %v", err)
+	}
+	choices, _ := completion["choices"].([]any)
+	if len(choices) != 1 {
+		t.Fatalf("choices = %d, want 1", len(choices))
+	}
+	choice, _ := choices[0].(map[string]any)
+	message, _ := choice["message"].(map[string]any)
+	calls, _ := message["tool_calls"].([]any)
+	if len(calls) != 2 {
+		t.Fatalf("tool calls = %d, want 2: %s", len(calls), raw)
+	}
+
+	assertCall := func(index int, wantID, wantName, wantArguments string) {
+		t.Helper()
+		call, _ := calls[index].(map[string]any)
+		function, _ := call["function"].(map[string]any)
+		if call["id"] != wantID || function["name"] != wantName || function["arguments"] != wantArguments {
+			t.Fatalf("tool call %d = %+v, want id=%s name=%s arguments=%s", index, call, wantID, wantName, wantArguments)
+		}
+	}
+	assertCall(0, "call-a", "alpha", `{"a":1}`)
+	assertCall(1, "call-b", "beta", `{"b":2}`)
+	if choice["finish_reason"] != "tool_calls" {
+		t.Fatalf("finish_reason = %v, want tool_calls", choice["finish_reason"])
+	}
+}
+
+func TestNormalizeNamedToolChoiceForCodeBuddy(t *testing.T) {
+	payload := map[string]any{
+		"tool_choice": map[string]any{
+			"type":     "function",
+			"function": map[string]any{"name": "get_weather"},
+		},
+		"tools": []any{
+			map[string]any{"type": "function", "function": map[string]any{"name": "search"}},
+			map[string]any{"type": "function", "function": map[string]any{"name": "get_weather"}},
+		},
+	}
+	if !normalizeToolChoiceForUpstream(payload) {
+		t.Fatal("named tool choice was not normalized")
+	}
+	if payload["tool_choice"] != "required" {
+		t.Fatalf("tool_choice = %v, want required", payload["tool_choice"])
+	}
+	tools, _ := payload["tools"].([]any)
+	if len(tools) != 1 {
+		t.Fatalf("tools = %d, want only the selected function", len(tools))
+	}
+	tool, _ := tools[0].(map[string]any)
+	function, _ := tool["function"].(map[string]any)
+	if function["name"] != "get_weather" {
+		t.Fatalf("selected tool = %v, want get_weather", function["name"])
+	}
+}
+
 func TestShutdownCancelsActiveStreams(t *testing.T) {
 	lifecycleMu.Lock()
 	lifecycleCtx, lifecycleStop = context.WithCancel(context.Background())

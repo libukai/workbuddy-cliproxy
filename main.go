@@ -1329,6 +1329,9 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 	if forceMaxThinking(obj) {
 		changed = true
 	}
+	if normalizeToolChoiceForUpstream(obj) {
+		changed = true
+	}
 	if !changed {
 		return payload
 	}
@@ -1337,6 +1340,45 @@ func rewriteSystemForUpstream(payload []byte) []byte {
 		return payload
 	}
 	return out
+}
+
+// normalizeToolChoiceForUpstream converts OpenAI's named function object into
+// the string form accepted by CodeBuddy. Filtering the tool list preserves the
+// caller's named-function intent even though CodeBuddy only accepts "required".
+func normalizeToolChoiceForUpstream(obj map[string]any) bool {
+	choice, ok := obj["tool_choice"].(map[string]any)
+	if !ok {
+		return false
+	}
+	choiceType, _ := choice["type"].(string)
+	if choiceType != "function" {
+		return false
+	}
+	function, _ := choice["function"].(map[string]any)
+	name, _ := function["name"].(string)
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return false
+	}
+	tools, _ := obj["tools"].([]any)
+	filtered := make([]any, 0, 1)
+	for _, rawTool := range tools {
+		tool, ok := rawTool.(map[string]any)
+		if !ok {
+			continue
+		}
+		toolFunction, _ := tool["function"].(map[string]any)
+		toolName, _ := toolFunction["name"].(string)
+		if strings.TrimSpace(toolName) == name {
+			filtered = append(filtered, rawTool)
+		}
+	}
+	if len(filtered) == 0 {
+		return false
+	}
+	obj["tools"] = filtered
+	obj["tool_choice"] = "required"
+	return true
 }
 
 // rewriteContentField sanitizes blocked templates in one message's content,
@@ -1394,13 +1436,106 @@ func forceMaxThinking(obj map[string]any) bool {
 	return true
 }
 
+type toolCallAccumulator struct {
+	id        string
+	typeName  string
+	name      string
+	arguments strings.Builder
+}
+
+type toolCallAggregator struct {
+	byIndex  map[int]*toolCallAccumulator
+	order    []int
+	fallback int
+}
+
+func (a *toolCallAggregator) add(rawCalls []any) {
+	if a.byIndex == nil {
+		a.byIndex = make(map[int]*toolCallAccumulator)
+	}
+	for _, rawCall := range rawCalls {
+		call, ok := rawCall.(map[string]any)
+		if !ok {
+			continue
+		}
+		index, hasIndex := toolCallIndex(call["index"])
+		if !hasIndex {
+			if len(a.order) == 1 {
+				index = a.order[0]
+			} else {
+				index = a.fallback
+				a.fallback++
+			}
+		}
+		item := a.byIndex[index]
+		if item == nil {
+			item = &toolCallAccumulator{}
+			a.byIndex[index] = item
+			a.order = append(a.order, index)
+		}
+		if value, ok := call["id"].(string); ok && value != "" {
+			item.id = value
+		}
+		if value, ok := call["type"].(string); ok && value != "" {
+			item.typeName = value
+		}
+		if function, ok := call["function"].(map[string]any); ok {
+			if value, ok := function["name"].(string); ok && value != "" {
+				item.name = value
+			}
+			if value, ok := function["arguments"].(string); ok {
+				item.arguments.WriteString(value)
+			}
+		}
+	}
+}
+
+func toolCallIndex(value any) (int, bool) {
+	switch index := value.(type) {
+	case float64:
+		return int(index), true
+	case int:
+		return index, true
+	case json.Number:
+		parsed, err := index.Int64()
+		return int(parsed), err == nil
+	default:
+		return 0, false
+	}
+}
+
+func (a *toolCallAggregator) build() []map[string]any {
+	if len(a.order) == 0 {
+		return nil
+	}
+	result := make([]map[string]any, 0, len(a.order))
+	for _, index := range a.order {
+		item := a.byIndex[index]
+		if item == nil {
+			continue
+		}
+		call := map[string]any{
+			"type": firstNonEmpty(item.typeName, "function"),
+			"function": map[string]any{
+				"name":      item.name,
+				"arguments": item.arguments.String(),
+			},
+		}
+		if item.id != "" {
+			call["id"] = item.id
+		}
+		result = append(result, call)
+	}
+	return result
+}
+
 // aggregateCompletion folds an SSE stream into a single non-streaming
 // chat.completion object (used for non-stream client requests).
 func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	var content, reasoning, role, respModel, respID, finish string
 	var created int64
 	var usage map[string]any
-	var toolCalls []map[string]any
+	var toolCalls toolCallAggregator
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
@@ -1439,11 +1574,7 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 					reasoning += v
 				}
 				if tcs, ok := delta["tool_calls"].([]any); ok {
-					for _, tc := range tcs {
-						if call, ok := tc.(map[string]any); ok {
-							toolCalls = append(toolCalls, call)
-						}
-					}
+					toolCalls.add(tcs)
 				}
 			}
 			if v, ok := choice["finish_reason"].(string); ok && v != "" {
@@ -1459,8 +1590,8 @@ func aggregateCompletion(r io.Reader, model string) ([]byte, error) {
 	if reasoning != "" {
 		message["reasoning_content"] = reasoning
 	}
-	if len(toolCalls) > 0 {
-		message["tool_calls"] = toolCalls
+	if calls := toolCalls.build(); len(calls) > 0 {
+		message["tool_calls"] = calls
 	}
 	if created == 0 {
 		created = time.Now().Unix()

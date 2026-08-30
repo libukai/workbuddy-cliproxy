@@ -82,6 +82,10 @@ workbuddy 转发前会对匹配到的旧模板做最小改写(`CLI`→`CLI tool`
 
 hy3 系列(`hy3` / `hy3-preview` / `hy3-preview-agent`)自动开最大思考:workbuddy 转发前强制 `reasoning_effort=high`,覆盖客户端任何设置。CodeBuddy 只对 `high` 真正开深度思考(`medium` / `max` / `xhigh` 等档位它直接忽略),所以这已是 hy3 能用的最高档。思考内容走 SSE 的 `delta.reasoning_content`,客户端要支持渲染思考块才看得到。
 
+## 工具调用
+
+非流式请求会按 `tool_calls[].index` 合并上游 SSE 中拆分的 ID、函数名和 arguments。CodeBuddy 的 `tool_choice` 只接受字符串；当客户端使用 OpenAI 的指定函数对象时，维护版会只保留被指定的函数并转换成 `"required"`，避免改变“必须调用该函数”的语义。
+
 ## 流式
 
 真流式(async):转发上游时边读边通过 `host.stream.emit` 把每个 chunk 实时推给 CPA,客户端逐字收到(不是等收齐了一股脑)。hy3 几千字的思考过程也是实时流出的,不是憋半天再刷出来。

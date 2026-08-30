@@ -12,7 +12,7 @@
 
 - Move model metadata and reasoning policy into a versioned manifest.
 - Split auth, transport, model, transformation, and streaming code into focused files.
-- Merge streamed tool-call fragments correctly for non-streaming clients.
+- Verify multi-turn tool results and parallel tool calls against live CodeBuddy models.
 - Preserve structured upstream error categories such as auth, quota, model, review, and retryable server errors.
 - Make prompt rewriting an explicit configuration option that is disabled by default.
 
