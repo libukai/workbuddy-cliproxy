@@ -154,7 +154,7 @@ func cliproxyPluginCall(method *C.char, request *C.uint8_t, requestLen C.size_t,
 	}
 	raw, errHandle := handleMethod(C.GoString(method), requestBytes)
 	if errHandle != nil {
-		writeResponse(response, errorEnvelope("plugin_error", errHandle.Error()))
+		writeResponse(response, errorEnvelopeFromError(errHandle))
 		return 1
 	}
 	writeResponse(response, raw)
@@ -295,9 +295,20 @@ type envelope struct {
 }
 
 type envelopeError struct {
-	Code    string `json:"code"`
-	Message string `json:"message"`
+	Code       string `json:"code"`
+	Message    string `json:"message"`
+	Retryable  bool   `json:"retryable,omitempty"`
+	HTTPStatus int    `json:"http_status,omitempty"`
 }
+
+type providerError struct {
+	code       string
+	message    string
+	retryable  bool
+	httpStatus int
+}
+
+func (e *providerError) Error() string { return e.message }
 
 type identifierResponse struct {
 	Identifier string `json:"identifier"`
@@ -752,13 +763,13 @@ func handleExecExecute(raw []byte) ([]byte, error) {
 	defer resp.Body.Close()
 	if resp.StatusCode >= 400 {
 		payload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(payload), 200))
+		return nil, newUpstreamError(resp.StatusCode, payload)
 	}
 	completion, err := aggregateCompletion(resp.Body, req.Model)
 	if err != nil {
 		return nil, err
 	}
-	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion})
+	return okEnvelope(pluginapi.ExecutorResponse{Payload: completion, Headers: resp.Header.Clone()})
 }
 
 // executorStreamRequest wraps the host's executor.execute_stream RPC: the
@@ -784,69 +795,61 @@ func handleExecStream(raw []byte) ([]byte, error) {
 	}
 	body = rewriteSystemForUpstream(body)
 
-	headers := streamHeaders()
 	sseFramed := clientNeedsSSEFrame(req.Metadata)
 
 	// No async stream id → fall back to synchronous chunk collection.
 	if req.StreamID == "" {
-		chunks, errCollect := collectUpstreamStream(body, sa, sseFramed)
+		chunks, headers, errCollect := collectUpstreamStream(body, sa, sseFramed)
 		if errCollect != nil {
 			return nil, errCollect
 		}
 		return okEnvelope(streamResponse{Headers: headers, Chunks: chunks})
 	}
 
-	// Async: return immediately with empty chunks. A goroutine pumps the upstream
-	// and emits each chunk via host.stream.emit so the client sees true streaming.
+	// Open the upstream synchronously so HTTP status and response headers are
+	// available before the plugin reports a successful stream to the host.
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
-		streamEmitError(req.StreamID, err.Error())
-		streamClose(req.StreamID)
-		return okEnvelope(streamResponse{Headers: headers})
+		return nil, err
 	}
 	streamCtx, ok := beginStream()
 	if !ok {
-		streamEmitError(req.StreamID, "plugin is shutting down")
-		streamClose(req.StreamID)
-		return okEnvelope(streamResponse{Headers: headers})
+		return nil, fmt.Errorf("plugin is shutting down")
 	}
 	httpReq = httpReq.WithContext(streamCtx)
 	backendHeaders(httpReq, sa)
+	resp, err := sharedHTTPClient().Do(httpReq)
+	if err != nil {
+		streamWG.Done()
+		return nil, fmt.Errorf("http_error: %w", err)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		streamWG.Done()
+		return nil, newUpstreamError(resp.StatusCode, payload)
+	}
+	headers := resp.Header.Clone()
+	applyStreamHeaders(headers)
 	go func() {
 		defer streamWG.Done()
-		pumpUpstreamStream(httpReq, req.StreamID, sseFramed)
+		pumpUpstreamStream(resp, httpReq.Context(), req.StreamID, sseFramed)
 	}()
 	return okEnvelope(streamResponse{Headers: headers})
 }
 
-func streamHeaders() http.Header {
-	h := http.Header{}
+func applyStreamHeaders(h http.Header) {
 	h.Set("Content-Type", "text/event-stream")
 	h.Set("Cache-Control", "no-cache")
 	h.Set("X-Accel-Buffering", "no")
-	return h
 }
 
 // pumpUpstreamStream reads the upstream SSE response in the background and
 // emits each cleaned chunk to the host stream. It closes the stream when done.
 // An emit failure (client disconnected → host closed the stream) aborts the
 // pump so we stop reading a dead upstream.
-func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) {
-	resp, err := sharedHTTPClient().Do(httpReq)
-	if err != nil {
-		if httpReq.Context().Err() == nil {
-			streamEmitError(streamID, fmt.Sprintf("http_error: %v", err))
-			streamClose(streamID)
-		}
-		return
-	}
+func pumpUpstreamStream(resp *http.Response, ctx context.Context, streamID string, sseFramed bool) {
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
-		errPayload, _ := io.ReadAll(resp.Body)
-		streamEmitError(streamID, fmt.Sprintf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200)))
-		streamClose(streamID)
-		return
-	}
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), 4*1024*1024)
 	for scanner.Scan() {
@@ -865,32 +868,38 @@ func pumpUpstreamStream(httpReq *http.Request, streamID string, sseFramed bool) 
 			break
 		}
 	}
-	if errScan := scanner.Err(); errScan != nil && httpReq.Context().Err() == nil {
+	if errScan := scanner.Err(); errScan != nil && ctx.Err() == nil {
 		streamEmitError(streamID, fmt.Sprintf("upstream stream read failed: %v", errScan))
 	}
-	if httpReq.Context().Err() == nil {
+	if ctx.Err() == nil {
 		streamClose(streamID)
 	}
 }
 
 // collectUpstreamStream is the synchronous fallback (no async stream id): drain
 // the upstream, clean each chunk, return them as a slice.
-func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, error) {
+func collectUpstreamStream(body []byte, sa *storedAuth, sseFramed bool) ([]pluginapi.ExecutorStreamChunk, http.Header, error) {
 	httpReq, err := http.NewRequest(http.MethodPost, endpointChat, bytes.NewReader(body))
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	backendHeaders(httpReq, sa)
 	resp, err := sharedHTTPClient().Do(httpReq)
 	if err != nil {
-		return nil, fmt.Errorf("http_error: %w", err)
+		return nil, nil, fmt.Errorf("http_error: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode >= 400 {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		errPayload, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("upstream %d: %s", resp.StatusCode, truncate(string(errPayload), 200))
+		return nil, nil, newUpstreamError(resp.StatusCode, errPayload)
 	}
-	return aggregateSSE(resp.Body, sseFramed)
+	chunks, errAggregate := aggregateSSE(resp.Body, sseFramed)
+	if errAggregate != nil {
+		return nil, nil, errAggregate
+	}
+	headers := resp.Header.Clone()
+	applyStreamHeaders(headers)
+	return chunks, headers, nil
 }
 
 // clientNeedsSSEFrame reports whether chunk payloads must carry their own
@@ -1218,6 +1227,49 @@ func okEnvelope(v any) ([]byte, error) {
 func errorEnvelope(code, message string) []byte {
 	raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{Code: code, Message: message}})
 	return raw
+}
+
+func errorEnvelopeFromError(err error) []byte {
+	if err == nil {
+		return errorEnvelope("plugin_error", "unknown plugin error")
+	}
+	if providerErr, ok := err.(*providerError); ok {
+		raw, _ := json.Marshal(envelope{OK: false, Error: &envelopeError{
+			Code:       providerErr.code,
+			Message:    providerErr.message,
+			Retryable:  providerErr.retryable,
+			HTTPStatus: providerErr.httpStatus,
+		}})
+		return raw
+	}
+	return errorEnvelope("plugin_error", err.Error())
+}
+
+func newUpstreamError(status int, body []byte) error {
+	code := "upstream_error"
+	retryable := false
+	switch status {
+	case http.StatusBadRequest, http.StatusNotFound, http.StatusUnprocessableEntity:
+		code = "upstream_bad_request"
+	case http.StatusUnauthorized, http.StatusForbidden:
+		code = "upstream_auth_error"
+	case http.StatusRequestTimeout:
+		code = "upstream_timeout"
+		retryable = true
+	case http.StatusTooManyRequests:
+		code = "upstream_rate_limit"
+		retryable = true
+	default:
+		if status >= 500 {
+			code = "upstream_server_error"
+			retryable = true
+		}
+	}
+	message := fmt.Sprintf("workbuddy upstream returned HTTP %d", status)
+	if summary := strings.TrimSpace(truncate(string(body), 500)); summary != "" {
+		message += ": " + summary
+	}
+	return &providerError{code: code, message: message, retryable: retryable, httpStatus: status}
 }
 
 func writeResponse(response *C.cliproxy_buffer, raw []byte) {

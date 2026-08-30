@@ -2,8 +2,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
+	"net/http"
 	"testing"
 	"time"
 )
@@ -99,6 +101,45 @@ func TestShutdownCancelsActiveStreams(t *testing.T) {
 	case <-done:
 	default:
 		t.Fatal("plugin shutdown returned before the active stream stopped")
+	}
+}
+
+func TestUpstreamErrorPreservesHTTPStatusAndRetryability(t *testing.T) {
+	tests := []struct {
+		status    int
+		code      string
+		retryable bool
+	}{
+		{status: http.StatusBadRequest, code: "upstream_bad_request"},
+		{status: http.StatusUnauthorized, code: "upstream_auth_error"},
+		{status: http.StatusTooManyRequests, code: "upstream_rate_limit", retryable: true},
+		{status: http.StatusServiceUnavailable, code: "upstream_server_error", retryable: true},
+	}
+	for _, tt := range tests {
+		t.Run(http.StatusText(tt.status), func(t *testing.T) {
+			raw := errorEnvelopeFromError(newUpstreamError(tt.status, []byte(`{"message":"upstream failure"}`)))
+			var got envelope
+			if err := json.Unmarshal(raw, &got); err != nil {
+				t.Fatalf("decode error envelope: %v", err)
+			}
+			if got.Error == nil {
+				t.Fatal("error envelope is missing error details")
+			}
+			if got.Error.HTTPStatus != tt.status || got.Error.Code != tt.code || got.Error.Retryable != tt.retryable {
+				t.Fatalf("error = %+v, want status=%d code=%s retryable=%v", got.Error, tt.status, tt.code, tt.retryable)
+			}
+		})
+	}
+}
+
+func TestApplyStreamHeadersPreservesUpstreamMetadata(t *testing.T) {
+	headers := http.Header{"X-Request-Id": {"request-123"}}
+	applyStreamHeaders(headers)
+	if got := headers.Get("X-Request-Id"); got != "request-123" {
+		t.Fatalf("X-Request-Id = %q, want request-123", got)
+	}
+	if got := headers.Get("Content-Type"); got != "text/event-stream" {
+		t.Fatalf("Content-Type = %q, want text/event-stream", got)
 	}
 }
 

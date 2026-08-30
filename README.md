@@ -95,6 +95,8 @@ CGO_ENABLED=1 go build -buildmode=c-shared -o workbuddy.dylib .
 
 发布或更新模型时不能只检查 `/v1/models`;至少要用目标账号对每个新增模型发出一次最小真实请求。当前维护版会把凭据过期时间同步给 CLIProxyAPI 的刷新调度，并在插件卸载时取消正在运行的异步流。
 
+架构优化以 CLIProxyAPI 官方 Kimi Provider 为主要参考，具体差异和迁移边界见 [`docs/OFFICIAL_PROVIDER_GAP.md`](docs/OFFICIAL_PROVIDER_GAP.md)。外置插件只依赖公开 Plugin ABI，不导入 CLIProxyAPI 的 `internal/*` 包。
+
 ## License
 
 MIT。
